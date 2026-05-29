@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data: 原本・前処理済みはコミットしない（README と .gitkeep のみ管理）
+data/**/raw/*
+data/**/processed/*
+!data/**/raw/.gitkeep
+!data/**/processed/.gitkeep
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Notebook 実行出力（必要に応じて）
+# *.ipynb
