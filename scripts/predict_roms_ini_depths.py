@@ -46,22 +46,26 @@ TARGET_DEPTHS = [0.0, 200.0, 500.0, 1000.0, 3000.0]
 
 # Display metadata per tracer. Units differ: nutrients/carbon are umol/kg,
 # Chla is mg/m3, and the isotope ratios C13/O18 are in per mil.
+# `clip` (lo, hi) bounds the prediction to a physically plausible range so
+# extrapolation outside the training domain (e.g. low-salinity coastal cells)
+# cannot produce absurd values. Especially important for log-target models,
+# where 10** turns an extrapolated log into a runaway number.
 TRACER_META = {
-    "TA": dict(long="Total alkalinity", unit="umol/kg", cmap="viridis"),
-    "DIC": dict(long="Dissolved inorganic carbon", unit="umol/kg", cmap="viridis"),
-    "NO3": dict(long="Nitrate", unit="umol/kg", cmap="cividis"),
-    "PO4": dict(long="Phosphate", unit="umol/kg", cmap="cividis"),
-    "SiO4": dict(long="Silicate", unit="umol/kg", cmap="cividis"),
-    "O2": dict(long="Dissolved oxygen", unit="umol/kg", cmap="turbo"),
-    "DOC": dict(long="Dissolved organic carbon", unit="umol/kg", cmap="viridis"),
-    "Chla": dict(long="Chlorophyll-a", unit="mg/m3", cmap="YlGn"),
-    "TDN": dict(long="Total dissolved nitrogen", unit="umol/kg", cmap="cividis"),
-    "TOC": dict(long="Total organic carbon", unit="umol/kg", cmap="viridis"),
-    "DON": dict(long="Dissolved organic nitrogen", unit="umol/kg", cmap="cividis"),
-    "C13": dict(long="d13C of DIC", unit="permil", cmap="coolwarm"),
-    "O18": dict(long="d18O", unit="permil", cmap="coolwarm"),
-    "C14": dict(long="Delta-14C of DIC", unit="permil", cmap="coolwarm"),
-    "H3": dict(long="Tritium", unit="TU", cmap="magma"),
+    "TA": dict(long="Total alkalinity", unit="umol/kg", cmap="viridis", clip=(2000, 2600)),
+    "DIC": dict(long="Dissolved inorganic carbon", unit="umol/kg", cmap="viridis", clip=(1800, 2500)),
+    "NO3": dict(long="Nitrate", unit="umol/kg", cmap="cividis", clip=(0, 60)),
+    "PO4": dict(long="Phosphate", unit="umol/kg", cmap="cividis", clip=(0, 5)),
+    "SiO4": dict(long="Silicate", unit="umol/kg", cmap="cividis", clip=(0, 250)),
+    "O2": dict(long="Dissolved oxygen", unit="umol/kg", cmap="turbo", clip=(0, 500)),
+    "DOC": dict(long="Dissolved organic carbon", unit="umol/kg", cmap="viridis", clip=(0, 200)),
+    "Chla": dict(long="Chlorophyll-a", unit="mg/m3", cmap="YlGn", clip=(0, 50)),
+    "TDN": dict(long="Total dissolved nitrogen", unit="umol/kg", cmap="cividis", clip=(0, 60)),
+    "TOC": dict(long="Total organic carbon", unit="umol/kg", cmap="viridis", clip=(0, 200)),
+    "DON": dict(long="Dissolved organic nitrogen", unit="umol/kg", cmap="cividis", clip=(0, 60)),
+    "C13": dict(long="d13C of DIC", unit="permil", cmap="coolwarm", clip=(-5, 5)),
+    "O18": dict(long="d18O", unit="permil", cmap="coolwarm", clip=(-5, 5)),
+    "C14": dict(long="Delta-14C of DIC", unit="permil", cmap="coolwarm", clip=(-300, 250)),
+    "H3": dict(long="Tritium", unit="TU", cmap="magma", clip=(0, 80)),
 }
 
 # GLODAP open-ocean salinity floor; below this, predictions are extrapolation.
@@ -97,7 +101,8 @@ def interp_to_depth(data, z, target_z):
     return np.where(valid, out, np.nan)
 
 
-def predict_field(model, normalizer, X, device, log_target=False, batch=200_000):
+def predict_field(model, normalizer, X, device, log_target=False,
+                  clip=None, batch=200_000):
     model.eval()
     Xn = normalizer.transform_x(X).astype(np.float32)
     preds = []
@@ -106,7 +111,16 @@ def predict_field(model, normalizer, X, device, log_target=False, batch=200_000)
             xb = torch.from_numpy(Xn[i:i + batch]).to(device)
             preds.append(model(xb).cpu().numpy())
     pred = normalizer.inverse_transform_y(np.concatenate(preds))
-    return np.power(10.0, pred) if log_target else pred
+    if log_target:
+        # Clip in log space first so 10** cannot overflow on extrapolation.
+        if clip is not None:
+            lo, hi = clip
+            log_lo = -np.inf if lo <= 0 else np.log10(lo)
+            pred = np.clip(pred, log_lo, np.log10(hi))
+        pred = np.power(10.0, pred)
+    elif clip is not None:
+        pred = np.clip(pred, clip[0], clip[1])
+    return pred
 
 
 def parse_args():
@@ -198,7 +212,7 @@ def main() -> int:
         for ax, pd_ in zip(axes, per_depth):
             field = np.full((J, I), np.nan)
             pred = predict_field(model, normalizer, pd_["X"], device,
-                                 log_target=log_target)
+                                 log_target=log_target, clip=m.get("clip"))
             field[pd_["jj"], pd_["ii"]] = pred
 
             finite = field[np.isfinite(field)]
