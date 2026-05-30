@@ -40,7 +40,8 @@ OUT_DIR = Path(__file__).resolve().parent.parent / "figures" / "roms_ini_pred"
 
 TARGET_DEPTHS = [0.0, 200.0, 500.0, 1000.0, 3000.0]
 
-# Display metadata per tracer (GLODAP targets are all umol/kg).
+# Display metadata per tracer. Units differ: nutrients/carbon are umol/kg,
+# Chla is mg/m3, and the isotope ratios C13/O18 are in per mil.
 TRACER_META = {
     "TA": dict(long="Total alkalinity", unit="umol/kg", cmap="viridis"),
     "DIC": dict(long="Dissolved inorganic carbon", unit="umol/kg", cmap="viridis"),
@@ -48,6 +49,13 @@ TRACER_META = {
     "PO4": dict(long="Phosphate", unit="umol/kg", cmap="cividis"),
     "SiO4": dict(long="Silicate", unit="umol/kg", cmap="cividis"),
     "O2": dict(long="Dissolved oxygen", unit="umol/kg", cmap="turbo"),
+    "DOC": dict(long="Dissolved organic carbon", unit="umol/kg", cmap="viridis"),
+    "Chla": dict(long="Chlorophyll-a", unit="mg/m3", cmap="YlGn"),
+    "TDN": dict(long="Total dissolved nitrogen", unit="umol/kg", cmap="cividis"),
+    "TOC": dict(long="Total organic carbon", unit="umol/kg", cmap="viridis"),
+    "DON": dict(long="Dissolved organic nitrogen", unit="umol/kg", cmap="cividis"),
+    "C13": dict(long="d13C of DIC", unit="permil", cmap="coolwarm"),
+    "O18": dict(long="d18O", unit="permil", cmap="coolwarm"),
 }
 
 # GLODAP open-ocean salinity floor; below this, predictions are extrapolation.

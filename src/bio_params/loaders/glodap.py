@@ -21,7 +21,11 @@ SOURCE_NAME = "glodap"
 MISSING_SENTINEL = -9999
 
 # Canonical target name -> (value column, flag column).
-# Non-core variables (DOC, Chla) have no WOCE QC flag column.
+# All GLODAPv2.2023 variables below carry a WOCE QC flag column (G2<var>f);
+# for the non-core variables (DOC, Chla, TDN, TOC, DON, C13, O18) every
+# reported value is flagged 2, so flag filtering is a no-op but kept for
+# uniformity. Note their units differ: nutrients/carbon are umol/kg, Chla is
+# mg/m3 (~ug/L), and C13/O18 are isotope ratios in per mil.
 TARGET_COLUMNS: dict[str, tuple[str, str | None]] = {
     "DIC":  ("G2tco2",      "G2tco2f"),
     "TA":   ("G2talk",      "G2talkf"),
@@ -29,8 +33,13 @@ TARGET_COLUMNS: dict[str, tuple[str, str | None]] = {
     "PO4":  ("G2phosphate", "G2phosphatef"),
     "SiO4": ("G2silicate",  "G2silicatef"),
     "O2":   ("G2oxygen",    "G2oxygenf"),
-    "DOC":  ("G2doc",       None),
-    "Chla": ("G2chla",      None),
+    "DOC":  ("G2doc",       "G2docf"),
+    "Chla": ("G2chla",      "G2chlaf"),
+    "TDN":  ("G2tdn",       "G2tdnf"),
+    "TOC":  ("G2toc",       "G2tocf"),
+    "DON":  ("G2don",       "G2donf"),
+    "C13":  ("G2c13",       "G2c13f"),
+    "O18":  ("G2o18",       "G2o18f"),
 }
 
 # Common-schema column name -> GLODAP column name.
