@@ -9,13 +9,17 @@ This is the ROMS inference template from CLAUDE.md. For each fixed depth it:
   3. runs each saved per-target model (with its own saved normalizer),
   4. draws one contour/pcolormesh map per (tracer, depth).
 
-CAVEAT: the GLODAP models were trained on open-ocean water (S ~ 33-37). This
-domain contains low-salinity coastal / inland-sea water; predictions there are
+Works with either GLODAP or BGC-Argo artifacts via --source; the artifact's
+saved log_target flag is honored (predictions back-transformed with 10**).
+
+CAVEAT: the models were trained on open-ocean water (S ~ 33-37). This domain
+contains low-salinity coastal / inland-sea water; predictions there are
 extrapolation and unreliable until local fine-tuning. Panels are annotated.
 
 Usage:
     uv run python scripts/predict_roms_ini_depths.py
     uv run python scripts/predict_roms_ini_depths.py --targets TA DIC
+    uv run python scripts/predict_roms_ini_depths.py --source bgc_argo --targets Chla O2 NO3
 """
 from __future__ import annotations
 
@@ -56,6 +60,8 @@ TRACER_META = {
     "DON": dict(long="Dissolved organic nitrogen", unit="umol/kg", cmap="cividis"),
     "C13": dict(long="d13C of DIC", unit="permil", cmap="coolwarm"),
     "O18": dict(long="d18O", unit="permil", cmap="coolwarm"),
+    "C14": dict(long="Delta-14C of DIC", unit="permil", cmap="coolwarm"),
+    "H3": dict(long="Tritium", unit="TU", cmap="magma"),
 }
 
 # GLODAP open-ocean salinity floor; below this, predictions are extrapolation.
@@ -91,7 +97,7 @@ def interp_to_depth(data, z, target_z):
     return np.where(valid, out, np.nan)
 
 
-def predict_field(model, normalizer, X, device, batch=200_000):
+def predict_field(model, normalizer, X, device, log_target=False, batch=200_000):
     model.eval()
     Xn = normalizer.transform_x(X).astype(np.float32)
     preds = []
@@ -99,11 +105,14 @@ def predict_field(model, normalizer, X, device, batch=200_000):
         for i in range(0, len(Xn), batch):
             xb = torch.from_numpy(Xn[i:i + batch]).to(device)
             preds.append(model(xb).cpu().numpy())
-    return normalizer.inverse_transform_y(np.concatenate(preds))
+    pred = normalizer.inverse_transform_y(np.concatenate(preds))
+    return np.power(10.0, pred) if log_target else pred
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--source", default="glodap", choices=["glodap", "bgc_argo"],
+                   help="Artifact prefix: glodap_<t>.pt or bgc_argo_<t>.pt")
     p.add_argument("--targets", nargs="+", default=list(TRACER_META),
                    choices=list(TRACER_META))
     return p.parse_args()
@@ -111,9 +120,10 @@ def parse_args():
 
 def main() -> int:
     args = parse_args()
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = OUT_DIR if args.source == "glodap" else OUT_DIR.parent / f"roms_ini_pred_{args.source}"
+    out_dir.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device: {device}")
+    print(f"device: {device}  source: {args.source}")
 
     import xarray as xr
     ds = xr.open_dataset(INI, decode_times=False)
@@ -165,15 +175,20 @@ def main() -> int:
         ))
 
     for tgt in args.targets:
-        art = MODEL_DIR / f"glodap_{tgt}.pt"
+        art = MODEL_DIR / f"{args.source}_{tgt}.pt"
         if not art.exists():
             print(f"skip {tgt}: artifact missing ({art})")
             continue
         model, normalizer, meta = load_artifact(art, map_location=device)
         model.to(device)
-        cv_r2 = meta["extra"].get("cv_r2_mean")
+        extra = meta["extra"]
+        cv_r2 = extra.get("cv_r2_mean")
+        log_target = bool(extra.get("log_target", False))
+        if extra.get("include_season"):
+            print(f"skip {tgt}: model needs season features (no time on ROMS ini)")
+            continue
         m = TRACER_META[tgt]
-        print(f"{tgt}: CV R2={cv_r2:.4f}")
+        print(f"{tgt}: CV R2={cv_r2:.4f}  log_target={log_target}")
 
         fig, axes = plt.subplots(
             1, len(TARGET_DEPTHS),
@@ -182,7 +197,8 @@ def main() -> int:
         )
         for ax, pd_ in zip(axes, per_depth):
             field = np.full((J, I), np.nan)
-            pred = predict_field(model, normalizer, pd_["X"], device)
+            pred = predict_field(model, normalizer, pd_["X"], device,
+                                 log_target=log_target)
             field[pd_["jj"], pd_["ii"]] = pred
 
             finite = field[np.isfinite(field)]
@@ -213,12 +229,12 @@ def main() -> int:
             cb.set_label(f"{tgt} ({m['unit']})", fontsize=9)
 
         fig.suptitle(
-            f"{m['long']} ({tgt}) — GLODAP MLP prediction on ROMS grid\n"
+            f"{m['long']} ({tgt}) — {args.source} MLP prediction on ROMS grid\n"
             f"{INI.name}  |  honest spatial-CV R2={cv_r2:.4f}  "
             f"(hatch = S<{SALT_OPEN_OCEAN_MIN:.0f} PSU: extrapolation)",
             fontsize=12,
         )
-        out = OUT_DIR / f"pred_{tgt}_depths.png"
+        out = out_dir / f"pred_{tgt}_depths.png"
         fig.savefig(out, dpi=110, bbox_inches="tight")
         plt.close(fig)
         print(f"  saved {out}")
