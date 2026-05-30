@@ -82,6 +82,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hidden", type=int, default=128)
     p.add_argument("--n-hidden-layers", type=int, default=3)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--subsample", type=int, default=None,
+                   help="Randomly keep at most N rows (for huge targets like "
+                        "global O2). Sampling is uniform over all levels, so it "
+                        "preserves the spatial/seasonal distribution.")
     p.add_argument("--no-final", action="store_true")
     p.add_argument("--log-every", type=int, default=25)
     return p.parse_args()
@@ -100,6 +104,12 @@ def main() -> int:
     if len(df) == 0:
         print("ERROR: no rows; download floats first via download_bgc_argo.py")
         return 1
+
+    if args.subsample is not None and len(df) > args.subsample:
+        rng = np.random.default_rng(args.seed)
+        keep = rng.choice(len(df), size=args.subsample, replace=False)
+        df = df.iloc[np.sort(keep)].reset_index(drop=True)
+        print(f"  subsampled to {len(df):,} rows (uniform, seed={args.seed})")
 
     feats = build_features(
         df, include_sigma_theta=args.include_sigma, include_season=args.season
