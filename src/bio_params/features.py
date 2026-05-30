@@ -1,13 +1,16 @@
 """Feature engineering: raw coordinates + T,S -> model input matrix.
 
-The MLP takes a 7-dim feature vector (8-dim with sigma_theta):
+The MLP takes a 7-dim feature vector by default; optional add-ons extend it:
     lat_sin, lat_cos, lon_sin, lon_cos, log_depth, temperature, salinity
-    [, sigma_theta]
+    [, sigma_theta]          # include_sigma_theta
+    [, doy_sin, doy_cos]     # include_season (day-of-year, circular)
 
 Rationale (see CLAUDE.md): lon/lat are mapped to circular coordinates so
 +180/-180 is continuous; depth is log-transformed to resolve the surface;
 T and S are passed raw because biogeochemical tracers correlate strongly
-with the water mass.
+with the water mass. Day-of-year is encoded as sin/cos so Dec 31 and Jan 1
+are continuous; it matters for variables with a strong seasonal cycle
+(e.g. Chl-a) and requires a datetime `time` column in the input.
 """
 from __future__ import annotations
 
@@ -24,22 +27,36 @@ FEATURE_NAMES_BASE = [
     "log_depth",
     "temperature", "salinity",
 ]
-FEATURE_NAMES_WITH_SIGMA = FEATURE_NAMES_BASE + ["sigma_theta"]
+SEASON_FEATURES = ["doy_sin", "doy_cos"]
+
+# Days in a mean year, used to map day-of-year onto a circle.
+_DAYS_PER_YEAR = 365.25
 
 
-def feature_names(include_sigma_theta: bool = False) -> list[str]:
-    return FEATURE_NAMES_WITH_SIGMA if include_sigma_theta else FEATURE_NAMES_BASE
+def feature_names(
+    include_sigma_theta: bool = False,
+    include_season: bool = False,
+) -> list[str]:
+    names = list(FEATURE_NAMES_BASE)
+    if include_sigma_theta:
+        names.append("sigma_theta")
+    if include_season:
+        names.extend(SEASON_FEATURES)
+    return names
 
 
 def build_features(
     df: pd.DataFrame,
     *,
     include_sigma_theta: bool = False,
+    include_season: bool = False,
 ) -> pd.DataFrame:
     """Build the model-ready feature matrix from common-schema rows.
 
-    Returns a new DataFrame with `feature_names(include_sigma_theta)` columns,
-    in the same row order as the input. The input is not modified.
+    Returns a new DataFrame with
+    `feature_names(include_sigma_theta, include_season)` columns, in the same
+    row order as the input. The input is not modified. `include_season`
+    requires a datetime `time` column.
     """
     missing = [c for c in REQUIRED_INPUTS if c not in df.columns]
     if missing:
@@ -73,7 +90,22 @@ def build_features(
             latitude=df["latitude"].to_numpy(),
         )
 
-    return out[feature_names(include_sigma_theta)]
+    if include_season:
+        if "time" not in df.columns:
+            raise ValueError("include_season=True requires a 'time' column")
+        doy_sin, doy_cos = _season(df["time"])
+        out["doy_sin"] = doy_sin
+        out["doy_cos"] = doy_cos
+
+    return out[feature_names(include_sigma_theta, include_season)]
+
+
+def _season(time: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    """Circular day-of-year encoding (sin, cos) from a datetime column."""
+    t = pd.to_datetime(time)
+    doy = t.dt.dayofyear.to_numpy().astype(np.float64)
+    angle = 2.0 * np.pi * doy / _DAYS_PER_YEAR
+    return np.sin(angle), np.cos(angle)
 
 
 def _sigma_theta(
