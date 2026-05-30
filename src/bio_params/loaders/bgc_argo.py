@@ -44,6 +44,17 @@ DEFAULT_MODES: dict[str, tuple[str, ...]] = {
     "NO3": ("D", "A"),
 }
 
+# Physical plausibility range (inclusive) per target, in the project's units.
+# A few values survive the WOCE QC flag yet are clearly unphysical (e.g. a
+# single NO3 of 449.62 umol/kg vs an ocean max ~50). These bounds drop such
+# spikes so they do not distort normalization / RMSE. Bounds are generous so
+# legitimate deep-water extremes are kept.
+VALID_RANGE: dict[str, tuple[float, float]] = {
+    "O2": (0.0, 500.0),     # umol/kg; allow surface supersaturation
+    "NO3": (0.0, 60.0),     # umol/kg; NW Pacific deep ~45
+    "Chla": (0.0, 50.0),    # mg/m3
+}
+
 JULD_EPOCH = np.datetime64("1950-01-01T00:00:00")
 
 
@@ -188,10 +199,14 @@ def load_bgc_argo(
     box: tuple[float, float, float, float] | None = None,
     modes: tuple[str, ...] | None = None,
     qc_ok: set[str] | None = None,
+    valid_range: tuple[float, float] | None = None,
 ) -> pd.DataFrame:
     """Load all _Sprof.nc in `sprof_dir` into common-schema rows for `target`.
 
     `box` = (lon0, lon1, lat0, lat1) optionally clips to a region.
+    `valid_range` = (lo, hi) drops out-of-range target values; defaults to
+    `VALID_RANGE[target]` (a physical plausibility filter for QC survivors).
+    Pass `(-inf, inf)` to disable.
     """
     sprof_dir = Path(sprof_dir)
     files = sorted(sprof_dir.glob("*_Sprof.nc"))
@@ -208,5 +223,10 @@ def load_bgc_argo(
         lon0, lon1, lat0, lat1 = box
         df = df[(df.latitude >= lat0) & (df.latitude <= lat1)
                 & (df.longitude >= lon0) & (df.longitude <= lon1)]
+
+    rng = valid_range if valid_range is not None else VALID_RANGE.get(target)
+    if rng is not None:
+        lo, hi = rng
+        df = df[(df[target] >= lo) & (df[target] <= hi)]
 
     return df.reset_index(drop=True)
