@@ -155,8 +155,14 @@ def main() -> int:
     cv_rmse = extra.get("cv_rmse_mean")
     print(f"  log_target={log_target}  season={include_season}  CV R2={cv_r2:.4f}")
 
-    print(f"Loading {target} from BGC-Argo ...")
-    df = load_bgc_argo(args.sprof_dir, target=target, box=KUROSHIO_BOX)
+    # Use the box the model was trained on (global or Kuroshio), saved in the
+    # artifact, so the scatter covers the model's actual domain.
+    box = tuple(extra.get("box", KUROSHIO_BOX))
+    is_global = box[0] <= -179 and box[1] >= 179
+    box_label = "global" if is_global else f"box {box[0]:.0f}-{box[1]:.0f}E,{box[2]:.0f}-{box[3]:.0f}N"
+
+    print(f"Loading {target} from BGC-Argo (box={box}) ...")
+    df = load_bgc_argo(args.sprof_dir, target=target, box=box)
     feats = build_features(df, include_sigma_theta=include_sigma,
                            include_season=include_season)
     X = feats.to_numpy()
@@ -168,10 +174,10 @@ def main() -> int:
     print("Predicting ...")
     pred = predict_all(model, normalizer, X, log_target)
     s_all = compute_stats(y, pred)
-    print(f"  Kuroshio-box in-sample: {stats_text(s_all, unit)}")
+    print(f"  {box_label} in-sample: {stats_text(s_all, unit)}")
 
     title_box = (
-        f"{target}: BGC-Argo model vs obs (Kuroshio box 120-180E,10-50N)\n"
+        f"{target}: BGC-Argo model vs obs ({box_label})\n"
         f"{stats_text(s_all, unit)}\n"
         f"Honest spatial CV (5-fold): RMSE={cv_rmse:.3g} {unit}  R2={cv_r2:.4f}"
     )
