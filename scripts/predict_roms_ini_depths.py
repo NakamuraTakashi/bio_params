@@ -1,0 +1,224 @@
+"""Predict GLODAP-trained biogeochemical tracers on the ROMS grid and map
+them on fixed depth levels.
+
+This is the ROMS inference template from CLAUDE.md. For each fixed depth it:
+  1. interpolates the ini-file temperature & salinity to that depth using the
+     S-coordinate transform (Vtransform=2, Vstretching=4),
+  2. builds the SAME 7-dim feature vector used in training (lat/lon sin/cos,
+     log_depth, T, S) at every valid water-column grid point,
+  3. runs each saved per-target model (with its own saved normalizer),
+  4. draws one contour/pcolormesh map per (tracer, depth).
+
+CAVEAT: the GLODAP models were trained on open-ocean water (S ~ 33-37). This
+domain contains low-salinity coastal / inland-sea water; predictions there are
+extrapolation and unreliable until local fine-tuning. Panels are annotated.
+
+Usage:
+    uv run python scripts/predict_roms_ini_depths.py
+    uv run python scripts/predict_roms_ini_depths.py --targets TA DIC
+"""
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+
+from bio_params.features import build_features
+from bio_params.persist import load_artifact
+
+INI = Path("/mnt/d/COAWST_DATA/FORP_Kuroshio/Ini/Kuro_Ini_FORP_Nz30_20060102.00.nc")
+GRID = Path("/mnt/d/COAWST_DATA/FORP_Kuroshio/Grid/forp-kuroshio_grd_v0.0.nc")
+MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "pretrained"
+OUT_DIR = Path(__file__).resolve().parent.parent / "figures" / "roms_ini_pred"
+
+TARGET_DEPTHS = [0.0, 200.0, 500.0, 1000.0, 3000.0]
+
+# Display metadata per tracer (GLODAP targets are all umol/kg).
+TRACER_META = {
+    "TA": dict(long="Total alkalinity", unit="umol/kg", cmap="viridis"),
+    "DIC": dict(long="Dissolved inorganic carbon", unit="umol/kg", cmap="viridis"),
+    "NO3": dict(long="Nitrate", unit="umol/kg", cmap="cividis"),
+    "PO4": dict(long="Phosphate", unit="umol/kg", cmap="cividis"),
+    "SiO4": dict(long="Silicate", unit="umol/kg", cmap="cividis"),
+    "O2": dict(long="Dissolved oxygen", unit="umol/kg", cmap="turbo"),
+}
+
+# GLODAP open-ocean salinity floor; below this, predictions are extrapolation.
+SALT_OPEN_OCEAN_MIN = 33.0
+
+
+def compute_z_rho(h, zeta, s_rho, Cs_r, hc):
+    h = h[None, :, :]
+    zeta = zeta[None, :, :]
+    s = s_rho[:, None, None]
+    C = Cs_r[:, None, None]
+    S = (hc * s + h * C) / (hc + h)
+    return zeta + (zeta + h) * S
+
+
+def interp_to_depth(data, z, target_z):
+    """Linear interp of data (N,J,I) along z (N,J,I) to scalar target_z."""
+    n = z.shape[0]
+    idx = np.sum(z <= target_z, axis=0)
+    idx_lo = np.clip(idx - 1, 0, n - 1)
+    idx_hi = np.clip(idx, 0, n - 1)
+
+    def gather(a, k):
+        return np.take_along_axis(a, k[None, :, :], axis=0)[0]
+
+    z_lo, z_hi = gather(z, idx_lo), gather(z, idx_hi)
+    d_lo, d_hi = gather(data, idx_lo), gather(data, idx_hi)
+    denom = z_hi - z_lo
+    with np.errstate(invalid="ignore", divide="ignore"):
+        w = np.where(denom != 0, (target_z - z_lo) / denom, 0.0)
+    out = d_lo + w * (d_hi - d_lo)
+    valid = (idx >= 1) & (idx <= n - 1)
+    return np.where(valid, out, np.nan)
+
+
+def predict_field(model, normalizer, X, device, batch=200_000):
+    model.eval()
+    Xn = normalizer.transform_x(X).astype(np.float32)
+    preds = []
+    with torch.no_grad():
+        for i in range(0, len(Xn), batch):
+            xb = torch.from_numpy(Xn[i:i + batch]).to(device)
+            preds.append(model(xb).cpu().numpy())
+    return normalizer.inverse_transform_y(np.concatenate(preds))
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--targets", nargs="+", default=list(TRACER_META),
+                   choices=list(TRACER_META))
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"device: {device}")
+
+    import xarray as xr
+    ds = xr.open_dataset(INI, decode_times=False)
+    g = xr.open_dataset(GRID, decode_times=False)
+
+    h = g["h"].values.astype(np.float64)
+    h = np.where(h <= 0, np.nan, h)
+    mask = g["mask_rho"].values
+    lon = g["lon_rho"].values
+    lat = g["lat_rho"].values
+    zeta = ds["zeta"].isel(ocean_time=0).values.astype(np.float64)
+    s_rho = ds["s_rho"].values.astype(np.float64)
+    Cs_r = ds["Cs_r"].values.astype(np.float64)
+    hc = float(ds["hc"].values)
+    temp = ds["temp"].isel(ocean_time=0).values.astype(np.float64)
+    salt = ds["salt"].isel(ocean_time=0).values.astype(np.float64)
+
+    z_rho = compute_z_rho(h, zeta, s_rho, Cs_r, hc)
+    land = mask < 0.5
+    J, I = h.shape
+
+    # Pre-build raw features (and salinity) for each depth, shared by all models.
+    per_depth = []  # list of dict(label, depth_val, valid 2D bool, X raw, low_sal 2D bool)
+    for depth in TARGET_DEPTHS:
+        if depth == 0.0:
+            T2 = temp[-1].copy()
+            S2 = salt[-1].copy()
+            d2 = np.abs(z_rho[-1])           # actual surface-cell depth (m)
+            label = "surface"
+        else:
+            T2 = interp_to_depth(temp, z_rho, -depth)
+            S2 = interp_to_depth(salt, z_rho, -depth)
+            d2 = np.full((J, I), depth)
+            label = f"{depth:.0f} m"
+
+        valid = np.isfinite(T2) & np.isfinite(S2) & (~land)
+        jj, ii = np.where(valid)
+        feat_df = pd.DataFrame({
+            "latitude": lat[jj, ii],
+            "longitude": lon[jj, ii],
+            "depth": d2[jj, ii],
+            "temperature": T2[jj, ii],
+            "salinity": S2[jj, ii],
+        })
+        X = build_features(feat_df).to_numpy()
+        per_depth.append(dict(
+            label=label, valid=valid, jj=jj, ii=ii, X=X,
+            low_sal=(S2 < SALT_OPEN_OCEAN_MIN),
+        ))
+
+    for tgt in args.targets:
+        art = MODEL_DIR / f"glodap_{tgt}.pt"
+        if not art.exists():
+            print(f"skip {tgt}: artifact missing ({art})")
+            continue
+        model, normalizer, meta = load_artifact(art, map_location=device)
+        model.to(device)
+        cv_r2 = meta["extra"].get("cv_r2_mean")
+        m = TRACER_META[tgt]
+        print(f"{tgt}: CV R2={cv_r2:.4f}")
+
+        fig, axes = plt.subplots(
+            1, len(TARGET_DEPTHS),
+            figsize=(4.6 * len(TARGET_DEPTHS), 5.4),
+            constrained_layout=True,
+        )
+        for ax, pd_ in zip(axes, per_depth):
+            field = np.full((J, I), np.nan)
+            pred = predict_field(model, normalizer, pd_["X"], device)
+            field[pd_["jj"], pd_["ii"]] = pred
+
+            finite = field[np.isfinite(field)]
+            vmin, vmax = (np.percentile(finite, [2, 98])
+                          if finite.size else (None, None))
+
+            pcm = ax.pcolormesh(
+                lon, lat, np.ma.masked_invalid(field),
+                cmap=m["cmap"], vmin=vmin, vmax=vmax, shading="auto",
+            )
+            ax.set_facecolor("0.8")
+            # Hatch where salinity is outside the GLODAP training range.
+            low = pd_["low_sal"] & pd_["valid"]
+            if low.any():
+                ax.contourf(lon, lat, low.astype(float), levels=[0.5, 1.5],
+                            colors="none", hatches=["xx"])
+            n_low = int(low.sum())
+            ax.set_title(f"{pd_['label']}"
+                         + (f"\n(S<{SALT_OPEN_OCEAN_MIN:.0f}: {n_low:,} pts hatched)"
+                            if n_low else ""),
+                         fontsize=10)
+            ax.set_xlabel("Longitude")
+            if ax is axes[0]:
+                ax.set_ylabel("Latitude")
+            ax.set_aspect("equal")
+            cb = fig.colorbar(pcm, ax=ax, orientation="horizontal",
+                              pad=0.08, fraction=0.05)
+            cb.set_label(f"{tgt} ({m['unit']})", fontsize=9)
+
+        fig.suptitle(
+            f"{m['long']} ({tgt}) — GLODAP MLP prediction on ROMS grid\n"
+            f"{INI.name}  |  honest spatial-CV R2={cv_r2:.4f}  "
+            f"(hatch = S<{SALT_OPEN_OCEAN_MIN:.0f} PSU: extrapolation)",
+            fontsize=12,
+        )
+        out = OUT_DIR / f"pred_{tgt}_depths.png"
+        fig.savefig(out, dpi=110, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  saved {out}")
+
+    ds.close()
+    g.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
