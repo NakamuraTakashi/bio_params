@@ -197,6 +197,9 @@ def load_bgc_argo(
 
     frames = [load_sprof_file(f, target, modes=modes, qc_ok=qc_ok) for f in files]
     df = pd.concat(frames, ignore_index=True)
+    # Concatenating with empty frames can demote `time` to object dtype, which
+    # breaks the .dt accessor used downstream (e.g. day-of-year features).
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
 
     if box is not None:
         lon0, lon1, lat0, lat1 = box
