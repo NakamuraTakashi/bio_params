@@ -28,3 +28,7 @@ Thumbs.db
 
 # Notebook 実行出力（必要に応じて）
 # *.ipynb
+
+# 生成画像はコミットしない（スクリプトで再生成可能）
+figures/**/*.png
+figures/*.png
