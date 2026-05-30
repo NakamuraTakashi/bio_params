@@ -35,8 +35,11 @@ TARGET_PARAM: dict[str, str] = {
 }
 
 # Default profile data-mode policy per target.
+# BGC-Argo CHLA is rarely in delayed mode (~1% of profiles in the Kuroshio
+# box), so delayed-only would discard almost all data; we accept adjusted
+# real-time (A) as well. A-mode CHLA is factory-calibrated and auto-adjusted.
 DEFAULT_MODES: dict[str, tuple[str, ...]] = {
-    "Chla": ("D",),          # delayed-mode only: cleanest CHLA
+    "Chla": ("D", "A"),
     "O2": ("D", "A"),
     "NO3": ("D", "A"),
 }

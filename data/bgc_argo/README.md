@@ -33,7 +33,10 @@ uv run python scripts/download_bgc_argo.py --target CHLA   # 全フロート
 - 領域: 黒潮流路をカバーする **経度 120–180°E、緯度 10–50°N**（ROMS 外洋ネストの境界条件用途）。
 - 値は **`*_ADJUSTED`** フィールドを使用（生値ではなく較正済み）。
 - QC フラグ ∈ {1, 2}（good / probably good）の層のみ採用。T・S・P の QC も同基準。
-- データモード方針: **Chl-a は delayed-mode (D) のみ**（最高品質）。O2・NO3 は D と A（adjusted real-time）を許容。
+- データモード方針: **Chl-a・O2・NO3 とも D（delayed-mode）と A（adjusted real-time）を許容**。
+  BGC-Argo の Chl-a は delayed-mode が極端に少なく（黒潮域95フロートで全 CHLA プロファイルの約1.4%、
+  実質164プロファイルのみ）、D のみだと学習に不足する。A を含めると約25万層・全12か月・2018–2026年をカバー
+  （D のみは約8万層・2018年1–4月のみ）。A モードは factory 較正＋自動補正済みで実用上の標準。
 - 単位は GLODAP と整合: DOXY/NITRATE = µmol/kg、CHLA = mg/m³、深度は圧力(dbar)から TEOS-10 で換算。
 
 ## スキーマ
