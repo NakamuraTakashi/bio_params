@@ -22,10 +22,13 @@ MISSING_SENTINEL = -9999
 
 # Canonical target name -> (value column, flag column).
 # All GLODAPv2.2023 variables below carry a WOCE QC flag column (G2<var>f);
-# for the non-core variables (DOC, Chla, TDN, TOC, DON, C13, O18) every
-# reported value is flagged 2, so flag filtering is a no-op but kept for
+# for the non-core variables (DOC, Chla, TDN, TOC, DON, C13, O18, C14, H3)
+# every reported value is flagged 2, so flag filtering is a no-op but kept for
 # uniformity. Note their units differ: nutrients/carbon are umol/kg, Chla is
-# mg/m3 (~ug/L), and C13/O18 are isotope ratios in per mil.
+# mg/m3 (~ug/L), C13/O18/C14 are isotope ratios in per mil (C14 = Delta-14C),
+# and H3 (tritium) is in tritium units (TU). C14 and H3 are transient tracers
+# (they decay / reflect bomb input) so a static T-S model is only a rough
+# spatial proxy; included for exploratory / future use.
 TARGET_COLUMNS: dict[str, tuple[str, str | None]] = {
     "DIC":  ("G2tco2",      "G2tco2f"),
     "TA":   ("G2talk",      "G2talkf"),
@@ -40,6 +43,8 @@ TARGET_COLUMNS: dict[str, tuple[str, str | None]] = {
     "DON":  ("G2don",       "G2donf"),
     "C13":  ("G2c13",       "G2c13f"),
     "O18":  ("G2o18",       "G2o18f"),
+    "C14":  ("G2c14",       "G2c14f"),
+    "H3":   ("G2h3",        "G2h3f"),
 }
 
 # Common-schema column name -> GLODAP column name.
