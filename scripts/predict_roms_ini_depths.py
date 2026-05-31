@@ -179,8 +179,9 @@ def blend_low_salinity(pred, salinity, target):
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--source", default="glodap", choices=["glodap", "bgc_argo"],
-                   help="Artifact prefix: glodap_<t>.pt or bgc_argo_<t>.pt")
+    p.add_argument("--source", default="glodap",
+                   choices=["glodap", "bgc_argo", "combined"],
+                   help="Artifact prefix: glodap_<t>.pt / bgc_argo_<t>.pt / combined_<t>.pt")
     p.add_argument("--targets", nargs="+", default=list(TRACER_META),
                    choices=list(TRACER_META))
     p.add_argument("--low-sal-regression", action="store_true",
