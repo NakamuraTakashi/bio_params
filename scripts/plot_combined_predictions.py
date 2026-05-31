@@ -120,11 +120,19 @@ def main() -> int:
     X = build_features(df).to_numpy()
     y = df[target].to_numpy()
     src = df["source"].to_numpy()
+    lat = df["latitude"].to_numpy()
+    lon = ((df["longitude"].to_numpy() + 180) % 360) - 180
     pred = predict_all(model, normalizer, X, device)
+
+    # Japan-coast window (120-160E, 20-50N), matching the coverage maps.
+    jp = (lon >= 120) & (lon <= 160) & (lat >= 20) & (lat <= 50)
 
     for label, mask in [("all", np.ones(len(df), bool)),
                         ("glodap", src == "glodap"),
-                        ("bgc_argo", src == "bgc_argo")]:
+                        ("bgc_argo", src == "bgc_argo"),
+                        ("japan", jp),
+                        ("japan_glodap", jp & (src == "glodap")),
+                        ("japan_bgc_argo", jp & (src == "bgc_argo"))]:
         s = compute_stats(y[mask], pred[mask])
         print(f"  {label}: n={s.n:,}  RMSE={s.rmse:.3g}  R2={s.r2:.4f}")
         scatter(y[mask], pred[mask], unit=unit,
