@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "GLODAP海洋生物地球化学パラメータ予測モデル（ROMS初期値・境界条件用）"
 requires-python = ">=3.12"
 dependencies = [
+    "cartopy>=0.25.0",
     "gsw>=3.6.21",
     "matplotlib>=3.10.9",
     "netcdf4>=1.7.4",
