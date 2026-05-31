@@ -125,9 +125,17 @@ def load_sprof_file(
         psal = _level_field(ds, "PSAL_ADJUSTED")
         pres = _level_field(ds, "PRES_ADJUSTED")
 
+        # Per-profile position; some profiles have missing/failed GPS fixes
+        # (NaN LATITUDE/LONGITUDE). Exclude those so downstream features are
+        # finite (a single such profile poisons feature/normalizer math).
+        lat_col = ds["LATITUDE"].values.astype(np.float64)[:, None]
+        lon_col = ds["LONGITUDE"].values.astype(np.float64)[:, None]
+        pos_ok = np.isfinite(lat_col) & np.isfinite(lon_col)  # (N_PROF, 1)
+
         ok = (
             np.isfinite(value) & np.isfinite(temp)
             & np.isfinite(psal) & np.isfinite(pres)
+            & pos_ok
             & _qc_ok(ds, f"{val_name}_QC", qc_ok, shape)
             & _qc_ok(ds, "TEMP_ADJUSTED_QC", qc_ok, shape)
             & _qc_ok(ds, "PSAL_ADJUSTED_QC", qc_ok, shape)
@@ -142,12 +150,10 @@ def load_sprof_file(
         if not ok.any():
             return _empty(target)
 
-        # Per-profile scalars broadcast to levels.
-        lat = ds["LATITUDE"].values.astype(np.float64)[:, None]
-        lon = ds["LONGITUDE"].values.astype(np.float64)[:, None]
+        # Per-profile scalars broadcast to levels (reuse lat/lon from above).
         juld = ds["JULD"].values                                # datetime64 or float
-        lat_b = np.broadcast_to(lat, shape)[ok]
-        lon_b = np.broadcast_to(lon, shape)[ok]
+        lat_b = np.broadcast_to(lat_col, shape)[ok]
+        lon_b = np.broadcast_to(lon_col, shape)[ok]
 
         # Depth (m, positive down) from pressure via TEOS-10.
         import gsw
