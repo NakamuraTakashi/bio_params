@@ -1,4 +1,11 @@
-"""Training loop with early stopping for the per-target MLP."""
+"""Training loop with early stopping for the per-target MLP.
+
+The MLP is tiny (7 -> 128x3 -> 1), so per-batch CPU->GPU transfer and the
+DataLoader/Python overhead dominate, not the GPU math. We therefore move the
+whole (already-normalized) dataset onto the device once and iterate with index
+slicing. This is ~10x faster than a num_workers=0 DataLoader for datasets of a
+few million rows (which still fit in GPU memory: ~8 cols * 4 B * 3e6 ~ 100 MB).
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -6,7 +13,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 
 @dataclass
@@ -50,15 +57,9 @@ def train(
     device = _resolve_device(cfg.device)
     model.to(device)
 
-    pin = device.type == "cuda"
-    train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, pin_memory=pin,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=pin,
-    )
+    # Move the whole dataset onto the device once (see module docstring).
+    Xtr, ytr = _device_tensors(train_ds, device)
+    Xva, yva = _device_tensors(val_ds, device)
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
@@ -73,9 +74,9 @@ def train(
 
     for epoch in range(1, cfg.epochs + 1):
         train_loss = _run_epoch(
-            model, train_loader, loss_fn, device, optimizer
+            model, Xtr, ytr, loss_fn, cfg.batch_size, optimizer
         )
-        val_loss = _run_epoch(model, val_loader, loss_fn, device, optimizer=None)
+        val_loss = _run_epoch(model, Xva, yva, loss_fn, cfg.batch_size, optimizer=None)
         history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
 
         improved = val_loss < best_val_loss
@@ -108,23 +109,44 @@ def train(
     )
 
 
+def _device_tensors(ds: Dataset, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the dataset's (X, y) as contiguous tensors on `device`.
+
+    Fast path for TabularDataset (exposes .X/.y); otherwise stack via indexing.
+    """
+    X = getattr(ds, "X", None)
+    y = getattr(ds, "y", None)
+    if X is None or y is None:
+        xs, ys = zip(*[ds[i] for i in range(len(ds))])
+        X = torch.stack([torch.as_tensor(x) for x in xs])
+        y = torch.stack([torch.as_tensor(t) for t in ys])
+    return X.to(device), y.to(device)
+
+
 def _run_epoch(
     model: nn.Module,
-    loader: DataLoader,
+    X: torch.Tensor,
+    y: torch.Tensor,
     loss_fn: nn.Module,
-    device: torch.device,
+    batch_size: int,
     optimizer: torch.optim.Optimizer | None,
 ) -> float:
-    """Run one epoch. Training when `optimizer` is provided, else eval."""
+    """Run one epoch over device-resident tensors via index slicing.
+
+    Training when `optimizer` is provided, else eval. The running loss is
+    accumulated on-device and synced once at the end (no per-batch .item()).
+    """
     is_train = optimizer is not None
     model.train(is_train)
-    total_loss = 0.0
-    total_n = 0
+    n = X.shape[0]
+    order = torch.randperm(n, device=X.device) if is_train else torch.arange(n, device=X.device)
+    total_loss = torch.zeros((), device=X.device)
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
-        for xb, yb in loader:
-            xb = xb.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
+        for i in range(0, n, batch_size):
+            idx = order[i:i + batch_size]
+            xb = X[idx]
+            yb = y[idx]
             if is_train:
                 optimizer.zero_grad()
             pred = model(xb)
@@ -132,7 +154,5 @@ def _run_epoch(
             if is_train:
                 loss.backward()
                 optimizer.step()
-            n = xb.size(0)
-            total_loss += loss.item() * n
-            total_n += n
-    return total_loss / total_n
+            total_loss += loss.detach() * xb.size(0)
+    return float((total_loss / n).item())
