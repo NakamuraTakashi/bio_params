@@ -68,6 +68,23 @@ TRACER_META = {
     "H3": dict(long="Tritium", unit="TU", cmap="magma", clip=(0, 80)),
 }
 
+# Low-salinity nutrient correction (river/coastal mixing line).
+# In low-salinity coastal water the MLP extrapolates badly; nutrients there
+# follow a near-linear salinity mixing line instead. These OLS fits come from
+# GLODAP surface (<=20 m) data in the East China Sea / Changjiang-diluted box
+# (118-124E, 25-32N): nutrient = slope * S + intercept.
+#   NO3: -5.315*S + 185.78  (R2=0.96)   PO4: -0.176*S + 6.29  (R2=0.81)
+# Applied to ALL low-salinity domain grid points as a provisional fix; the
+# Changjiang end-member differs from other river mouths, so values outside the
+# East China Sea are approximate. Blended with the MLP between S_LO and S_HI.
+SALINITY_REGRESSION = {
+    "NO3": dict(slope=-5.315, intercept=185.78),
+    "PO4": dict(slope=-0.176, intercept=6.29),
+}
+BLEND_S_LO = 30.8   # at/below this salinity -> pure regression (GLODAP min ~30.8)
+BLEND_S_HI = 34.0   # at/above this salinity -> pure MLP
+REGRESSION_S_FLOOR = 30.8  # clamp S used in the regression (don't extrapolate below fit range)
+
 # GLODAP open-ocean salinity floor; below this, predictions are extrapolation.
 SALT_OPEN_OCEAN_MIN = 33.0
 
@@ -123,12 +140,35 @@ def predict_field(model, normalizer, X, device, log_target=False,
     return pred
 
 
+def blend_low_salinity(pred, salinity, target):
+    """Blend MLP `pred` with the salinity mixing-line regression at low S.
+
+    Returns (blended, n_regression) where the regression dominates for
+    S <= BLEND_S_LO, the MLP for S >= BLEND_S_HI, and a linear weight in
+    between. Only NO3/PO4 have a regression; others are returned unchanged.
+    """
+    reg = SALINITY_REGRESSION.get(target)
+    if reg is None:
+        return pred, 0
+    s_clamped = np.maximum(salinity, REGRESSION_S_FLOOR)
+    reg_val = reg["slope"] * s_clamped + reg["intercept"]
+    reg_val = np.clip(reg_val, 0.0, None)  # nutrients are non-negative
+    # Weight w: 1 (pure regression) at S<=LO, 0 (pure MLP) at S>=HI.
+    w = (BLEND_S_HI - salinity) / (BLEND_S_HI - BLEND_S_LO)
+    w = np.clip(w, 0.0, 1.0)
+    blended = w * reg_val + (1.0 - w) * pred
+    return blended, int((w > 0).sum())
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--source", default="glodap", choices=["glodap", "bgc_argo"],
                    help="Artifact prefix: glodap_<t>.pt or bgc_argo_<t>.pt")
     p.add_argument("--targets", nargs="+", default=list(TRACER_META),
                    choices=list(TRACER_META))
+    p.add_argument("--low-sal-regression", action="store_true",
+                   help="Blend NO3/PO4 with the salinity mixing-line regression "
+                        "at low salinity instead of leaving the MLP extrapolation")
     return p.parse_args()
 
 
@@ -186,6 +226,7 @@ def main() -> int:
         per_depth.append(dict(
             label=label, valid=valid, jj=jj, ii=ii, X=X,
             low_sal=(S2 < SALT_OPEN_OCEAN_MIN),
+            salinity_pts=S2[jj, ii],
         ))
 
     for tgt in args.targets:
@@ -202,7 +243,9 @@ def main() -> int:
             print(f"skip {tgt}: model needs season features (no time on ROMS ini)")
             continue
         m = TRACER_META[tgt]
-        print(f"{tgt}: CV R2={cv_r2:.4f}  log_target={log_target}")
+        use_reg = args.low_sal_regression and tgt in SALINITY_REGRESSION
+        print(f"{tgt}: CV R2={cv_r2:.4f}  log_target={log_target}"
+              + ("  [low-sal regression blend ON]" if use_reg else ""))
 
         fig, axes = plt.subplots(
             1, len(TARGET_DEPTHS),
@@ -213,6 +256,8 @@ def main() -> int:
             field = np.full((J, I), np.nan)
             pred = predict_field(model, normalizer, pd_["X"], device,
                                  log_target=log_target, clip=m.get("clip"))
+            if use_reg:
+                pred, _ = blend_low_salinity(pred, pd_["salinity_pts"], tgt)
             field[pd_["jj"], pd_["ii"]] = pred
 
             finite = field[np.isfinite(field)]
@@ -224,16 +269,20 @@ def main() -> int:
                 cmap=m["cmap"], vmin=vmin, vmax=vmax, shading="auto",
             )
             ax.set_facecolor("0.8")
-            # Hatch where salinity is outside the GLODAP training range.
+            # Hatch the low-salinity region: extrapolation (xx) by default, or
+            # regression-filled (//) when the salinity blend is applied.
             low = pd_["low_sal"] & pd_["valid"]
             if low.any():
+                hatch = "//" if use_reg else "xx"
                 ax.contourf(lon, lat, low.astype(float), levels=[0.5, 1.5],
-                            colors="none", hatches=["xx"])
+                            colors="none", hatches=[hatch])
             n_low = int(low.sum())
-            ax.set_title(f"{pd_['label']}"
-                         + (f"\n(S<{SALT_OPEN_OCEAN_MIN:.0f}: {n_low:,} pts hatched)"
-                            if n_low else ""),
-                         fontsize=10)
+            if n_low:
+                note = (f"\n(S<{SALT_OPEN_OCEAN_MIN:.0f}: {n_low:,} pts "
+                        + ("regression-filled //)" if use_reg else "hatched xx)"))
+            else:
+                note = ""
+            ax.set_title(f"{pd_['label']}{note}", fontsize=10)
             ax.set_xlabel("Longitude")
             if ax is axes[0]:
                 ax.set_ylabel("Latitude")
