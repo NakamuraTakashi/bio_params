@@ -68,24 +68,35 @@ TRACER_META = {
     "H3": dict(long="Tritium", unit="TU", cmap="magma", clip=(0, 80)),
 }
 
-# Low-salinity nutrient correction (river/coastal mixing line).
-# In low-salinity coastal water the MLP extrapolates badly; nutrients there
-# follow a near-linear salinity mixing line instead. These OLS fits come from
-# GLODAP surface (<=20 m) data in the East China Sea / Changjiang-diluted box
-# (118-124E, 25-32N): value = slope * S + intercept.
+# Low-salinity correction (river/coastal mixing line).
+# In low-salinity coastal water the MLP extrapolates badly; several tracers
+# there follow a near-linear salinity mixing line instead. These OLS fits come
+# from GLODAP surface (<=20 m) data in the East China Sea / Changjiang-diluted
+# box (118-124E, 25-32N): value = slope * S + intercept.
 #   NO3:  -5.315*S + 185.78  (R2=0.96)
 #   PO4:  -0.176*S +   6.29  (R2=0.81)
 #   SiO4: -5.789*S + 207.03  (R2=0.95)   strong river signal (silicate)
+#   TA:   +8.390*S + 1983.5  (R2=0.71)   POSITIVE slope (river TA < ocean TA)
+#
 # Applied to ALL low-salinity domain grid points as a provisional fix; the
 # Changjiang end-member differs from other river mouths, so values outside the
 # East China Sea are approximate. Blended with the MLP between S_LO and S_HI.
-# Only species with a strong, negative river-mixing line are included here;
-# TA (positive slope, R2~0.7), O2/DIC (R2~0.6) and Chl-a (no salinity relation)
-# are intentionally left to the MLP.
+#
+# Validation of the TA freshwater end-member (S=0 intercept): our GLODAP fit
+# gives 1983.5 umol/kg, in good agreement (~3.5%) with the published Changjiang
+# freshwater end-member of ~2054 umol/kg (Xiong et al., 2019, Earth and Space
+# Science, doi:10.1029/2019EA000679). We keep the self-consistent GLODAP fit
+# value (1983.5) rather than substituting the literature value.
+#
+# DIC is intentionally excluded: its S=0 intercept (2466) far exceeds the
+# published Changjiang end-member (~1609 umol/kg; Xiong et al., 2019) because
+# DIC is non-conservative in the estuary (CO2 degassing / respiration), R2~0.57.
+# O2 (R2~0.6) and Chl-a (no salinity relation) are also left to the MLP.
 SALINITY_REGRESSION = {
     "NO3": dict(slope=-5.315, intercept=185.78),
     "PO4": dict(slope=-0.176, intercept=6.29),
     "SiO4": dict(slope=-5.789, intercept=207.03),
+    "TA": dict(slope=8.390, intercept=1983.5),
 }
 BLEND_S_LO = 30.8   # at/below this salinity -> pure regression (GLODAP min ~30.8)
 BLEND_S_HI = 34.0   # at/above this salinity -> pure MLP

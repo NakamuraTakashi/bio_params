@@ -22,6 +22,9 @@ data/**/processed/*
 .idea/
 *.swp
 
+# Claude Code local settings (per-user, not for the repo)
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
