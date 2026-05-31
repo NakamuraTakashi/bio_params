@@ -72,14 +72,20 @@ TRACER_META = {
 # In low-salinity coastal water the MLP extrapolates badly; nutrients there
 # follow a near-linear salinity mixing line instead. These OLS fits come from
 # GLODAP surface (<=20 m) data in the East China Sea / Changjiang-diluted box
-# (118-124E, 25-32N): nutrient = slope * S + intercept.
-#   NO3: -5.315*S + 185.78  (R2=0.96)   PO4: -0.176*S + 6.29  (R2=0.81)
+# (118-124E, 25-32N): value = slope * S + intercept.
+#   NO3:  -5.315*S + 185.78  (R2=0.96)
+#   PO4:  -0.176*S +   6.29  (R2=0.81)
+#   SiO4: -5.789*S + 207.03  (R2=0.95)   strong river signal (silicate)
 # Applied to ALL low-salinity domain grid points as a provisional fix; the
 # Changjiang end-member differs from other river mouths, so values outside the
 # East China Sea are approximate. Blended with the MLP between S_LO and S_HI.
+# Only species with a strong, negative river-mixing line are included here;
+# TA (positive slope, R2~0.7), O2/DIC (R2~0.6) and Chl-a (no salinity relation)
+# are intentionally left to the MLP.
 SALINITY_REGRESSION = {
     "NO3": dict(slope=-5.315, intercept=185.78),
     "PO4": dict(slope=-0.176, intercept=6.29),
+    "SiO4": dict(slope=-5.789, intercept=207.03),
 }
 BLEND_S_LO = 30.8   # at/below this salinity -> pure regression (GLODAP min ~30.8)
 BLEND_S_HI = 34.0   # at/above this salinity -> pure MLP
