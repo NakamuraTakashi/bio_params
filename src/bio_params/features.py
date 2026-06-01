@@ -6,6 +6,10 @@ The MLP takes a 7-dim feature vector by default; optional add-ons extend it:
     [, doy_sin, doy_cos]     # include_season (day-of-year, circular)
     [, surface_chla]         # include_surface_chla (SOCA-style surface anchor)
     [, log_mld]              # include_mld (mixed-layer depth, SOCA Zm input)
+    [, rel_light]            # include_rel_light (Beer-Lambert exp(-Kd*z), -> 0 deep)
+    [, NO3]                  # include_no3 (nitrate at the level, nutrient control)
+    [, no3_lit]              # include_no3_lit (NO3 * rel_light: light-gated nutrient,
+                             #                  -> 0 in the dark so no spurious deep Chl)
 
 Rationale (see CLAUDE.md): lon/lat are mapped to circular coordinates so
 +180/-180 is continuous; depth is log-transformed to resolve the surface;
@@ -59,6 +63,9 @@ def feature_names(
     include_surface_chla: bool = False,
     surface_chla_log: bool = True,
     include_mld: bool = False,
+    include_rel_light: bool = False,
+    include_no3: bool = False,
+    include_no3_lit: bool = False,
 ) -> list[str]:
     names = list(FEATURE_NAMES_BASE)
     if include_sigma_theta:
@@ -69,6 +76,12 @@ def feature_names(
         names.append(surface_chla_feature_name(surface_chla_log))
     if include_mld:
         names.append("log_mld")
+    if include_rel_light:
+        names.append("rel_light")
+    if include_no3:
+        names.append("NO3")
+    if include_no3_lit:
+        names.append("no3_lit")
     return names
 
 
@@ -80,6 +93,9 @@ def build_features(
     include_surface_chla: bool = False,
     surface_chla_log: bool = True,
     include_mld: bool = False,
+    include_rel_light: bool = False,
+    include_no3: bool = False,
+    include_no3_lit: bool = False,
 ) -> pd.DataFrame:
     """Build the model-ready feature matrix from common-schema rows.
 
@@ -146,9 +162,30 @@ def build_features(
         # log compresses the ~3-500 m MLD range, like log_depth.
         out["log_mld"] = np.log(df["mld"].to_numpy(dtype=np.float64) + 1.0)
 
+    if include_rel_light:
+        if "kd" not in df.columns:
+            raise ValueError("include_rel_light=True requires a 'kd' column "
+                             "(per-profile attenuation, see profiles.kd_from_surface_chl)")
+        # Beer-Lambert relative PAR: exp(-Kd*z), 1 at surface -> 0 in the dark.
+        kd = df["kd"].to_numpy(dtype=np.float64)
+        out["rel_light"] = np.exp(-kd * depth)
+
+    if include_no3:
+        if "NO3" not in df.columns:
+            raise ValueError("include_no3=True requires an 'NO3' column")
+        out["NO3"] = df["NO3"].to_numpy(dtype=np.float64)
+
+    if include_no3_lit:
+        if "NO3" not in df.columns or "kd" not in df.columns:
+            raise ValueError("include_no3_lit=True requires 'NO3' and 'kd' columns")
+        # Light-gated nutrient: NO3 weighted by available light; -> 0 in the dark.
+        out["no3_lit"] = (df["NO3"].to_numpy(dtype=np.float64)
+                          * np.exp(-df["kd"].to_numpy(dtype=np.float64) * depth))
+
     return out[feature_names(
         include_sigma_theta, include_season, include_surface_chla,
-        surface_chla_log, include_mld)]
+        surface_chla_log, include_mld, include_rel_light, include_no3,
+        include_no3_lit)]
 
 
 def _season(time: pd.Series) -> tuple[np.ndarray, np.ndarray]:

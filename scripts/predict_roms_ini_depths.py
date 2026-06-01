@@ -303,6 +303,9 @@ def parse_args():
     p.add_argument("--tag", default=None,
                    help="Artifact suffix, e.g. --tag satchl loads "
                         "<source>_<target>_satchl.pt (SOCA satellite-anchored)")
+    p.add_argument("--no3-model", default="combined",
+                   help="NO3 model prefix used to supply the NO3 feature for "
+                        "gated Chl-a models (loads <prefix>_NO3.pt)")
     return p.parse_args()
 
 
@@ -365,9 +368,11 @@ def main() -> int:
             salinity_pts=S2[jj, ii],
         ))
 
-    # Lazily-loaded satellite surface Chl-a field and MLD field (if a model needs them).
+    # Lazily-loaded satellite surface Chl-a field, MLD field, and NO3 model
+    # (the gated Chl-a model takes NO3 as a feature: predict it first, feed it in).
     sat_field = {"loaded": False, "data": None}
     mld_field = {"loaded": False, "data": None}
+    no3_holder = {"model": None, "norm": None}
 
     for tgt in args.targets:
         art = MODEL_DIR / f"{args.source}_{tgt}{tag_suffix}.pt"
@@ -386,7 +391,12 @@ def main() -> int:
         surface_chla = bool(extra.get("surface_chla", False))
         surface_chla_log = bool(extra.get("surface_chla_log", True))
         include_mld = bool(extra.get("include_mld", False))
+        include_no3 = bool(extra.get("include_no3", False))
         relative_target = bool(extra.get("relative_target", False))
+        output_gate = bool(extra.get("output_gate", False))
+        gate_ik = float(extra.get("gate_ik", 0.005))
+        ik_head = bool(extra.get("ik_head", False))
+        gate_ik_ref = float(extra.get("gate_ik_ref", 0.02))
         rel_cap = float(extra.get("rel_cap", 20.0))
         # Relative models multiply by the satellite surface field for amplitude.
         need_sat = surface_chla or relative_target
@@ -399,6 +409,11 @@ def main() -> int:
             print("  computing mixed-layer depth field ...")
             mld_field["data"] = compute_mld_field(temp, salt, z_rho, lat)
             mld_field["loaded"] = True
+        if include_no3 and no3_holder["model"] is None:
+            no3_art = MODEL_DIR / f"{args.no3_model}_NO3.pt"
+            print(f"  loading NO3 model for the nutrient feature ({no3_art.name}) ...")
+            nm, nn, _ = load_artifact(no3_art, map_location=device)
+            no3_holder.update(model=nm.to(device), norm=nn)
         m = TRACER_META[tgt]
         use_reg = args.low_sal_regression and tgt in SALINITY_REGRESSION
         print(f"{tgt}: CV R2={cv_r2:.4f}  log_target={log_target}"
@@ -407,17 +422,43 @@ def main() -> int:
               + ("  [+MLD]" if include_mld else "")
               + ("  [low-sal regression blend ON]" if use_reg else ""))
 
+        def _no3_for(pd_):
+            # NO3 feature: predict it from the base features with the NO3 model
+            # (cache per depth). Clip to a physical range.
+            if "no3_pred" not in pd_:
+                pd_["no3_pred"] = predict_field(no3_holder["model"], no3_holder["norm"],
+                                                pd_["X"], device, clip=(0.0, 60.0))
+            return pd_["no3_pred"]
+
         def _build_X(pd_):
-            if not (surface_chla or include_mld):
+            if not (surface_chla or include_mld or include_no3):
                 return pd_["X"]
             df2 = pd_["feat_df"].copy()
             if surface_chla:
                 df2["surface_chla"] = sat_field["data"][pd_["jj"], pd_["ii"]]
             if include_mld:
                 df2["mld"] = mld_field["data"][pd_["jj"], pd_["ii"]]
+            if include_no3:
+                df2["NO3"] = _no3_for(pd_)
             return build_features(df2, include_surface_chla=surface_chla,
                                   surface_chla_log=surface_chla_log,
-                                  include_mld=include_mld).to_numpy()
+                                  include_mld=include_mld,
+                                  include_no3=include_no3).to_numpy()
+
+        def _gated_rel(pd_):
+            # rel = softplus(g) * tanh(rel_light/Ik); rel_light = exp(-Kd*z),
+            # Kd from satellite surface Chl. -> 0 in the dark for any Ik. With an
+            # Ik head the model outputs (g, Ik) per sample; else Ik is global.
+            jj, ii = pd_["jj"], pd_["ii"]
+            out = predict_field(model, normalizer, _build_X(pd_), device, clip=None)
+            if ik_head:
+                g = np.logaddexp(0.0, out[:, 0])                      # softplus
+                ik = gate_ik_ref * np.exp(np.clip(out[:, 1], -5.0, 5.0))
+            else:
+                g = np.logaddexp(0.0, out); ik = gate_ik
+            kd = np.log(100.0) / morel_euphotic_depth(sat_field["data"][jj, ii])
+            rl = np.exp(-kd * pd_["feat_df"]["depth"].to_numpy())
+            return np.clip(g * np.tanh(rl / ik), 0.0, rel_cap)
 
         # For relative models, re-anchor the predicted profile to its own
         # predicted surface so the surface maps EXACTLY to the satellite value
@@ -426,16 +467,18 @@ def main() -> int:
         zp_field = None
         if relative_target:
             ps = per_depth[0]  # TARGET_DEPTHS[0] == 0.0 -> surface
-            r0 = np.clip(predict_field(model, normalizer, _build_X(ps), device,
-                                       clip=None), 0.0, rel_cap)
+            r0 = (_gated_rel(ps) if output_gate
+                  else np.clip(predict_field(model, normalizer, _build_X(ps), device,
+                                             clip=None), 0.0, rel_cap))
             rel_surf = np.full((J, I), np.nan)
             # Tiny floor only to avoid divide-by-zero; the surface ratio is then
             # r0/r0 == 1 exactly (so surface maps exactly to the satellite value).
             rel_surf[ps["jj"], ps["ii"]] = np.maximum(r0, 1e-6)
-            # Productive-layer base Zp = max(euphotic depth from satellite Chl, MLD);
-            # Chl is tapered to 0 below it (no deep data constrains it).
-            zp_field = np.fmax(morel_euphotic_depth(sat_field["data"]),
-                               mld_field["data"])
+            # Non-gated relative models need the productive-layer taper to kill
+            # deep Chl; the gated model handles that structurally (no taper).
+            if not output_gate:
+                zp_field = np.fmax(morel_euphotic_depth(sat_field["data"]),
+                                   mld_field["data"])
 
         fig, axes = plt.subplots(
             1, len(TARGET_DEPTHS),
@@ -451,16 +494,18 @@ def main() -> int:
                     # The satellite IS the surface truth (ratio == 1 by definition).
                     pred = sat_field["data"][jj, ii].copy()
                 else:
-                    rel = np.clip(predict_field(model, normalizer, X, device, clip=None),
-                                  0.0, rel_cap)
+                    rel = _gated_rel(pd_) if output_gate else np.clip(
+                        predict_field(model, normalizer, X, device, clip=None),
+                        0.0, rel_cap)
                     # Re-anchor to the predicted surface; clip the ratio so a tiny
                     # predicted surface cannot blow the deep value up.
                     rel = np.clip(rel / rel_surf[jj, ii], 0.0, rel_cap)
                     pred = rel * sat_field["data"][jj, ii]
-                # Productive-layer taper: Chl -> 0 below ~the euphotic/mixed layer
-                # (surface depth << taper start, so the surface is unchanged).
-                pred = pred * productive_taper(
-                    pd_["feat_df"]["depth"].to_numpy(), zp_field[jj, ii])
+                    if not output_gate:
+                        # Productive-layer taper: Chl -> 0 below the euphotic/mixed
+                        # layer (the gated model achieves this structurally instead).
+                        pred = pred * productive_taper(
+                            pd_["feat_df"]["depth"].to_numpy(), zp_field[jj, ii])
                 if m.get("clip") is not None:
                     pred = np.clip(pred, m["clip"][0], m["clip"][1])
             else:

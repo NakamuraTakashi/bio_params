@@ -36,10 +36,11 @@ from bio_params.cv import spatial_block_split
 from bio_params.dataset import Normalizer, TabularDataset
 from bio_params.features import build_features, feature_names
 from bio_params.loaders.bgc_argo import attach_surface_chla, load_bgc_argo
+from bio_params.loaders.chla_no3 import load_chla_no3
 from bio_params.loaders.combined import load_combined
 from bio_params.model import MLP, MLPConfig
 from bio_params.persist import save_artifact
-from bio_params.profiles import add_mld, add_relative_target
+from bio_params.profiles import add_mld, add_relative_target, kd_from_surface_chl
 from bio_params.train import TrainConfig, train
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,6 +67,14 @@ def parse_args() -> argparse.Namespace:
                         "columns stay intact)")
     p.add_argument("--no-mld", action="store_true",
                    help="ablation: drop the MLD feature (keeps same rows)")
+    p.add_argument("--with-no3", action="store_true",
+                   help="co-located Chl-a+NO3 data; add raw NO3 as a feature")
+    p.add_argument("--no3-light", action="store_true",
+                   help="use light-gated NO3 (NO3*rel_light) instead of raw NO3 "
+                        "(implies co-located data + Kd); -> 0 in the dark")
+    p.add_argument("--rel-light", action="store_true",
+                   help="add Beer-Lambert relative-light feature exp(-Kd*z) "
+                        "(Kd from surface Chl); lets Chl vanish in the dark")
     p.add_argument("--subsample", type=int, default=None)
     p.add_argument("--rel-cap", type=float, default=20.0)
     p.add_argument("--folds", type=int, default=5)
@@ -99,7 +108,14 @@ def main() -> int:
     suffix = f"_{args.tag}" if args.tag else ""
 
     print(f"=== relative Chla profile  source={args.source}{suffix} ===")
-    if args.source == "bgc_argo":
+    need_coloc = args.with_no3 or args.no3_light   # need an NO3 column
+    use_no3_raw = args.with_no3 and not args.no3_light
+    use_no3_lit = args.no3_light
+    need_kd = args.rel_light or args.no3_light
+
+    if need_coloc:
+        df = load_chla_no3(args.source, glodap_csv=args.csv, sprof_dir=args.sprof_dir)
+    elif args.source == "bgc_argo":
         df = load_bgc_argo(args.sprof_dir, "Chla")
     else:
         df = load_combined(args.csv, args.sprof_dir, target="Chla",
@@ -109,7 +125,15 @@ def main() -> int:
     df = add_mld(df)
     df = add_relative_target(df, "Chla", rel_cap=args.rel_cap)
     df = df[np.isfinite(df["mld"])].reset_index(drop=True)
-    print(f"  {len(df):,} rows with MLD + relative target")
+    if need_kd:
+        # Per-profile attenuation Kd from the (in-situ) surface Chl.
+        df["kd"] = kd_from_surface_chl(df["Chla_surf"].to_numpy())
+    if need_coloc:
+        df = df[np.isfinite(df["NO3"])].reset_index(drop=True)
+    print(f"  {len(df):,} rows with MLD + relative target"
+          + (" + NO3" if use_no3_raw else "")
+          + (" + NO3*light" if use_no3_lit else "")
+          + (" + rel_light" if args.rel_light else ""))
 
     # Satellite surface, for the absolute-reconstruction metric (and optionally
     # as a shape feature). Left merge keeps unmatched rows (abs metric skips them).
@@ -144,10 +168,12 @@ def main() -> int:
 
     include_mld_feat = not args.no_mld
     feats = build_features(df, include_mld=include_mld_feat,
-                           include_surface_chla=use_sat_feat,
-                           surface_chla_log=True)
+                           include_surface_chla=use_sat_feat, surface_chla_log=True,
+                           include_rel_light=args.rel_light,
+                           include_no3=use_no3_raw, include_no3_lit=use_no3_lit)
     fnames = feature_names(include_mld=include_mld_feat, include_surface_chla=use_sat_feat,
-                           surface_chla_log=True)
+                           surface_chla_log=True, include_rel_light=args.rel_light,
+                           include_no3=use_no3_raw, include_no3_lit=use_no3_lit)
     X = feats.to_numpy()
     y = df["Chla_rel"].to_numpy()
     chla_abs = df["Chla"].to_numpy()
@@ -200,7 +226,9 @@ def main() -> int:
                    / "processed")
     metrics_dir.mkdir(parents=True, exist_ok=True)
     payload = dict(target="Chla", source=args.source, relative_target=True,
-                   include_mld=include_mld_feat, surface_chla_feature=use_sat_feat,
+                   include_mld=include_mld_feat, include_rel_light=args.rel_light,
+                   include_no3=use_no3_raw, include_no3_lit=use_no3_lit,
+                   surface_chla_feature=use_sat_feat,
                    rel_cap=args.rel_cap, feature_names=fnames, n_rows=int(len(X)),
                    shape_r2_mean=float(sr2.mean()), shape_r2_median=float(np.median(sr2)),
                    abs_r2_mean=float(ar2.mean()), abs_r2_median=float(np.median(ar2)),
@@ -224,6 +252,8 @@ def main() -> int:
     save_artifact(art, model=final, normalizer=norm, feature_names=fnames,
                   target_name="Chla_rel",
                   extra=dict(source=args.source, relative_target=True, include_mld=include_mld_feat,
+                             include_rel_light=args.rel_light, include_no3=use_no3_raw,
+                             include_no3_lit=use_no3_lit,
                              surface_chla_feature=use_sat_feat, rel_cap=args.rel_cap,
                              log_target=False, include_season=False,
                              surface_chla=use_sat_feat, surface_chla_log=True,

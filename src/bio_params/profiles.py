@@ -20,6 +20,27 @@ import pandas as pd
 DEFAULT_KEYS = ("latitude", "longitude", "time")
 
 
+def morel_euphotic_depth(chl) -> np.ndarray:
+    """Euphotic depth Ze (1% surface light, m) from surface Chl-a (mg/m3).
+
+    Morel et al. (2007) Case-1 relation: log10(Ze) is a cubic in log10(Chl).
+    Ze ~ 12 m at Chl=10, ~33 m at Chl=1, ~85-120 m in oligotrophic water.
+    """
+    x = np.log10(np.clip(np.asarray(chl, dtype=np.float64), 1e-3, None))
+    log_ze = 1.524 - 0.436 * x - 0.0145 * x ** 2 + 0.0186 * x ** 3
+    return np.power(10.0, log_ze)
+
+
+def kd_from_surface_chl(chl) -> np.ndarray:
+    """Effective PAR attenuation Kd (1/m) from surface Chl-a, via the euphotic
+    depth: light reaches 1% at Ze, so exp(-Kd*Ze)=0.01 => Kd = ln(100)/Ze.
+
+    Used to build the Beer-Lambert relative-light feature exp(-Kd*z), which
+    decays to 0 with depth so a Chl model naturally vanishes below the lit zone.
+    """
+    return np.log(100.0) / morel_euphotic_depth(chl)
+
+
 def sigma0(salinity, temperature, depth, latitude) -> np.ndarray:
     """Potential density anomaly sigma_0 (kg/m3) via TEOS-10 (gsw)."""
     import gsw
