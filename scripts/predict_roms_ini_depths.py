@@ -195,7 +195,12 @@ def compute_mld_field(temp, salt, z_rho, lat, threshold=0.03, ref_depth=10.0):
     nearest ref_depth); returns a 2D (J, I) field, NaN over land/all-invalid.
     """
     N, J, I = temp.shape
-    d = (-z_rho)                       # positive depth, index 0 = deepest
+    # ROMS orders levels index 0 = deepest .. index -1 = surface. Reverse to
+    # surface-first so increasing index == increasing depth (the MLD scan and
+    # bio_params.profiles.add_mld both assume surface-first ordering).
+    d = (-z_rho)[::-1]                 # positive depth, index 0 = surface
+    temp = temp[::-1]
+    salt = salt[::-1]
     lat3 = np.broadcast_to(lat[None], (N, J, I))
     sig = sigma0(salt.ravel(), temp.ravel(), d.ravel(), lat3.ravel()).reshape(N, J, I)
     finite = np.isfinite(sig) & np.isfinite(d)
@@ -210,6 +215,37 @@ def compute_mld_field(temp, salt, z_rho, lat, threshold=0.03, ref_depth=10.0):
     deepest = np.where(finite, d, -np.inf).max(axis=0)
     mld = np.where(any_ex, mld, deepest)
     return np.where(finite.any(axis=0), mld, np.nan)
+
+
+def morel_euphotic_depth(chl):
+    """Euphotic depth Ze (1% light, m) from surface Chl-a (mg/m3).
+
+    Morel et al. (2007), Case-1 relation: log10(Ze) is a cubic in log10(Chl).
+    Ze ~ 12 m at Chl=10, ~33 m at Chl=1, ~85-120 m in oligotrophic water.
+    """
+    x = np.log10(np.clip(np.asarray(chl, dtype=np.float64), 1e-3, None))
+    log_ze = 1.524 - 0.436 * x - 0.0145 * x ** 2 + 0.0186 * x ** 3
+    return np.power(10.0, log_ze)
+
+
+def productive_taper(depth, zp, lo=1.5, hi=3.0):
+    """Smooth window (1 -> 0) that confines Chl to the productive layer.
+
+    w = 1 for depth <= lo*zp, a cosine taper to 0 between lo*zp and hi*zp, and 0
+    below. `zp` is the productive-layer base = max(euphotic depth, MLD) per point.
+    This enforces the physical "Chl -> 0 below the euphotic zone": neither
+    BGC-Argo nor GLODAP samples Chl deep enough to constrain it (both are
+    photic-zone), so the prior must be imposed, not learned. NaN zp -> w=1.
+    """
+    depth = np.asarray(depth, dtype=np.float64)
+    zp = np.asarray(zp, dtype=np.float64)
+    start, end = lo * zp, hi * zp
+    w = np.ones_like(depth)
+    mid = np.isfinite(zp) & (depth > start) & (depth < end)
+    w[mid] = 0.5 * (1.0 + np.cos(np.pi * (depth[mid] - start[mid])
+                                 / (end[mid] - start[mid])))
+    w[np.isfinite(zp) & (depth >= end)] = 0.0
+    return w
 
 
 def predict_field(model, normalizer, X, device, log_target=False,
@@ -387,6 +423,7 @@ def main() -> int:
         # predicted surface so the surface maps EXACTLY to the satellite value
         # (a regression does not output rel==1 at the surface by itself).
         rel_surf = None
+        zp_field = None
         if relative_target:
             ps = per_depth[0]  # TARGET_DEPTHS[0] == 0.0 -> surface
             r0 = np.clip(predict_field(model, normalizer, _build_X(ps), device,
@@ -395,6 +432,10 @@ def main() -> int:
             # Tiny floor only to avoid divide-by-zero; the surface ratio is then
             # r0/r0 == 1 exactly (so surface maps exactly to the satellite value).
             rel_surf[ps["jj"], ps["ii"]] = np.maximum(r0, 1e-6)
+            # Productive-layer base Zp = max(euphotic depth from satellite Chl, MLD);
+            # Chl is tapered to 0 below it (no deep data constrains it).
+            zp_field = np.fmax(morel_euphotic_depth(sat_field["data"]),
+                               mld_field["data"])
 
         fig, axes = plt.subplots(
             1, len(TARGET_DEPTHS),
@@ -416,6 +457,10 @@ def main() -> int:
                     # predicted surface cannot blow the deep value up.
                     rel = np.clip(rel / rel_surf[jj, ii], 0.0, rel_cap)
                     pred = rel * sat_field["data"][jj, ii]
+                # Productive-layer taper: Chl -> 0 below ~the euphotic/mixed layer
+                # (surface depth << taper start, so the surface is unchanged).
+                pred = pred * productive_taper(
+                    pd_["feat_df"]["depth"].to_numpy(), zp_field[jj, ii])
                 if m.get("clip") is not None:
                     pred = np.clip(pred, m["clip"][0], m["clip"][1])
             else:

@@ -29,6 +29,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 
 from bio_params.cv import spatial_block_split
@@ -59,6 +60,12 @@ def parse_args() -> argparse.Namespace:
                    help="Also feed satellite surface Chl-a as a shape feature "
                         "(requires a satellite match; restricts to matched rows)")
     p.add_argument("--per-source-max", type=int, default=None)
+    p.add_argument("--per-source-profiles", type=int, default=None,
+                   help="combined: keep at most N WHOLE profiles per source "
+                        "(profile-level balance; applied after MLD/relative so "
+                        "columns stay intact)")
+    p.add_argument("--no-mld", action="store_true",
+                   help="ablation: drop the MLD feature (keeps same rows)")
     p.add_argument("--subsample", type=int, default=None)
     p.add_argument("--rel-cap", type=float, default=20.0)
     p.add_argument("--folds", type=int, default=5)
@@ -112,15 +119,34 @@ def main() -> int:
         df = df[np.isfinite(df["surface_chla"])].reset_index(drop=True)
         print(f"  {len(df):,} rows with satellite (surface_chla feature ON)")
 
+    # Profile-level per-source balancing (keep whole profiles so MLD/relative,
+    # already computed above, stay valid). Used to give GLODAP coastal profiles
+    # real weight in the combined model (else BGC-Argo dwarfs them).
+    if args.per_source_profiles and "source" in df.columns:
+        keys = ["latitude", "longitude", "time"]
+        rng = np.random.default_rng(args.seed)
+        parts = []
+        for src, sub in df.groupby("source"):
+            profs = sub[keys].drop_duplicates()
+            if len(profs) > args.per_source_profiles:
+                profs = profs.iloc[np.sort(rng.choice(
+                    len(profs), args.per_source_profiles, replace=False))]
+            parts.append(sub.merge(profs, on=keys, how="inner"))
+        df = pd.concat(parts, ignore_index=True)
+        ng = int((df.source == "glodap").sum()); na = int((df.source == "bgc_argo").sum())
+        print(f"  balanced to <= {args.per_source_profiles} profiles/source: "
+              f"{len(df):,} rows (glodap={ng:,}, bgc_argo={na:,})")
+
     if args.subsample and len(df) > args.subsample:
         rng = np.random.default_rng(args.seed)
         df = df.iloc[np.sort(rng.choice(len(df), args.subsample, replace=False))].reset_index(drop=True)
         print(f"  subsampled to {len(df):,}")
 
-    feats = build_features(df, include_mld=True,
+    include_mld_feat = not args.no_mld
+    feats = build_features(df, include_mld=include_mld_feat,
                            include_surface_chla=use_sat_feat,
                            surface_chla_log=True)
-    fnames = feature_names(include_mld=True, include_surface_chla=use_sat_feat,
+    fnames = feature_names(include_mld=include_mld_feat, include_surface_chla=use_sat_feat,
                            surface_chla_log=True)
     X = feats.to_numpy()
     y = df["Chla_rel"].to_numpy()
@@ -174,7 +200,7 @@ def main() -> int:
                    / "processed")
     metrics_dir.mkdir(parents=True, exist_ok=True)
     payload = dict(target="Chla", source=args.source, relative_target=True,
-                   include_mld=True, surface_chla_feature=use_sat_feat,
+                   include_mld=include_mld_feat, surface_chla_feature=use_sat_feat,
                    rel_cap=args.rel_cap, feature_names=fnames, n_rows=int(len(X)),
                    shape_r2_mean=float(sr2.mean()), shape_r2_median=float(np.median(sr2)),
                    abs_r2_mean=float(ar2.mean()), abs_r2_median=float(np.median(ar2)),
@@ -197,7 +223,7 @@ def main() -> int:
     art = MODEL_DIR / f"{args.source}_Chla_rel{suffix}.pt"
     save_artifact(art, model=final, normalizer=norm, feature_names=fnames,
                   target_name="Chla_rel",
-                  extra=dict(source=args.source, relative_target=True, include_mld=True,
+                  extra=dict(source=args.source, relative_target=True, include_mld=include_mld_feat,
                              surface_chla_feature=use_sat_feat, rel_cap=args.rel_cap,
                              log_target=False, include_season=False,
                              surface_chla=use_sat_feat, surface_chla_log=True,
