@@ -35,3 +35,10 @@ Thumbs.db
 # 生成画像はコミットしない（スクリプトで再生成可能）
 figures/**/*.png
 figures/*.png
+
+# 参考文献の PDF はコミットしない（著作権・容量。出典は docs/*.md に記載）
+docs/**/*.pdf
+docs/*.pdf
+*.pdf
+# Dropbox が付与するサイドカー属性ファイル
+*:com.dropbox.attrs

@@ -67,6 +67,7 @@ def load_glodap(
     *,
     require_flag2: bool = True,
     drop_missing_coords: bool = True,
+    with_time: bool = False,
 ) -> pd.DataFrame:
     """Load one target's measurements from the GLODAP CSV.
 
@@ -103,7 +104,10 @@ def load_glodap(
     needed = list(COORDINATE_COLUMNS.values()) + [value_col]
     if flag_col is not None:
         needed.append(flag_col)
-    missing = [c for c in needed if c not in header]
+    time_cols = ["G2year", "G2month", "G2day"]
+    if with_time:
+        needed += [c for c in time_cols if c in header]
+    missing = [c for c in needed if c not in header and c not in time_cols]
     if missing:
         raise ValueError(f"CSV is missing required columns: {missing}")
 
@@ -138,4 +142,19 @@ def load_glodap(
     column_order = (
         list(COORDINATE_COLUMNS.keys()) + [target, flag_out, "source"]
     )
+
+    if with_time and all(c in df.columns for c in ("G2year", "G2month")):
+        # Build a real timestamp from year/month/day (day clamped to a valid
+        # mid-month default when absent), so profiles can be matched to the
+        # monthly satellite product. Invalid dates -> NaT.
+        day = (df["G2day"] if "G2day" in df.columns else 15)
+        parts = pd.DataFrame({
+            "year": pd.to_numeric(df["G2year"], errors="coerce"),
+            "month": pd.to_numeric(df["G2month"], errors="coerce"),
+            "day": pd.to_numeric(day, errors="coerce").fillna(15).clip(1, 28),
+        })
+        parts.loc[~parts["month"].between(1, 12), "month"] = np.nan
+        df["time"] = pd.to_datetime(parts, errors="coerce")
+        column_order = column_order + ["time"]
+
     return df[column_order].reset_index(drop=True)

@@ -52,7 +52,7 @@ def load_combined(
     if target not in COMMON_TARGETS:
         raise ValueError(f"combined loader supports {COMMON_TARGETS}, got {target!r}")
 
-    g = load_glodap(glodap_csv, target=target)
+    g = load_glodap(glodap_csv, target=target, with_time=True)
     if "time" not in g.columns:
         g = g.copy()
         g["time"] = pd.NaT

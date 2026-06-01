@@ -24,6 +24,7 @@ import torch
 from bio_params.cv import spatial_block_split
 from bio_params.dataset import Normalizer, TabularDataset
 from bio_params.features import build_features, feature_names
+from bio_params.loaders.bgc_argo import attach_surface_chla
 from bio_params.loaders.combined import available_targets, load_combined
 from bio_params.model import MLP, MLPConfig
 from bio_params.persist import save_artifact
@@ -34,6 +35,8 @@ DEFAULT_CSV = PROJECT_ROOT / "data" / "glodap" / "raw" / "GLODAPv2.2023_Merged_M
 DEFAULT_SPROF = PROJECT_ROOT / "data" / "bgc_argo" / "raw" / "floats"
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / "pretrained"
 DEFAULT_METRICS_DIR = PROJECT_ROOT / "data" / "combined" / "processed"
+DEFAULT_MATCHUP = (PROJECT_ROOT / "data" / "bgc_argo" / "processed"
+                   / "satchl_matchup_combined.parquet")
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +48,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--metrics-dir", type=Path, default=DEFAULT_METRICS_DIR)
     p.add_argument("--per-source-max", type=int, default=None,
                    help="Keep at most this many rows from EACH source (balance)")
+    p.add_argument("--surface-chla", action="store_true",
+                   help="Add SOCA-style satellite surface Chl-a feature")
+    p.add_argument("--surface-chla-linear", action="store_true",
+                   help="Use a linear surface-Chl feature instead of log10")
+    p.add_argument("--matchup", type=Path, default=DEFAULT_MATCHUP,
+                   help="Satellite surface-Chl matchup parquet (covers both sources)")
+    p.add_argument("--tag", default=None,
+                   help="Suffix for artifact/metrics names, e.g. --tag satchl")
     p.add_argument("--folds", type=int, default=5)
     p.add_argument("--block-deg", type=float, default=5.0)
     p.add_argument("--epochs", type=int, default=200)
@@ -80,15 +91,28 @@ def main() -> int:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    print(f"=== combined (GLODAP+BGC-Argo) target={args.target}  spatial block CV ===")
+    suffix = f"_{args.tag}" if args.tag else ""
+    print(f"=== combined (GLODAP+BGC-Argo) target={args.target}{suffix}  spatial block CV ===")
     df = load_combined(args.csv, args.sprof_dir, target=args.target,
                        per_source_max=args.per_source_max, seed=args.seed)
+
+    surface_chla = args.surface_chla
+    surface_chla_log = not args.surface_chla_linear
+    if surface_chla:
+        df = attach_surface_chla(df, args.matchup)
+        n_before = len(df)
+        df = df[np.isfinite(df["surface_chla"])].reset_index(drop=True)
+        print(f"  {len(df):,} rows with satellite surface Chl-a "
+              f"({n_before - len(df):,} dropped: unmatched/masked/out-of-range)")
+
     ng = int((df.source == "glodap").sum())
     na = int((df.source == "bgc_argo").sum())
     print(f"  rows: {len(df):,}  (glodap={ng:,} {100*ng/len(df):.1f}%, bgc_argo={na:,})")
 
-    feats = build_features(df)
-    fnames = feature_names()
+    feats = build_features(df, include_surface_chla=surface_chla,
+                           surface_chla_log=surface_chla_log)
+    fnames = feature_names(include_surface_chla=surface_chla,
+                           surface_chla_log=surface_chla_log)
     X = feats.to_numpy()
     y = df[args.target].to_numpy()
     lat = df["latitude"].to_numpy()
@@ -121,16 +145,19 @@ def main() -> int:
     print(f"RMSE: {rmses.mean():.3g} +/- {rmses.std():.3g}")
     print(f"R^2:  {r2s.mean():.4f} +/- {r2s.std():.4f}")
 
+    maes = np.array([m["mae"] for m in fold_metrics])
     payload = {"target": args.target, "source": "combined",
                "per_source_max": args.per_source_max, "n_rows": int(len(X)),
                "n_glodap": ng, "n_bgc_argo": na,
+               "surface_chla": surface_chla, "surface_chla_log": surface_chla_log,
                "feature_names": fnames, "n_folds": args.folds, "block_deg": args.block_deg,
                "rmse_mean": float(rmses.mean()), "rmse_std": float(rmses.std()),
+               "mae_mean": float(maes.mean()), "r2_median": float(np.median(r2s)),
                "r2_mean": float(r2s.mean()), "r2_std": float(r2s.std()),
                "folds": fold_metrics}
     args.metrics_dir.mkdir(parents=True, exist_ok=True)
-    (args.metrics_dir / f"cv_{args.target}.json").write_text(json.dumps(payload, indent=2))
-    print(f"\nSaved CV metrics -> {args.metrics_dir / f'cv_{args.target}.json'}")
+    (args.metrics_dir / f"cv_{args.target}{suffix}.json").write_text(json.dumps(payload, indent=2))
+    print(f"\nSaved CV metrics -> {args.metrics_dir / f'cv_{args.target}{suffix}.json'}")
 
     if args.no_final:
         return 0
@@ -146,12 +173,13 @@ def main() -> int:
     final_res = train(final_model, train_ds, val_ds, train_cfg)
     print(f"  trained for {final_res.n_epochs_run} epochs")
 
-    artifact_path = args.out_dir / f"combined_{args.target}.pt"
+    artifact_path = args.out_dir / f"combined_{args.target}{suffix}.pt"
     save_artifact(artifact_path, model=final_model, normalizer=norm,
                   feature_names=fnames, target_name=args.target,
                   extra={"source": "combined", "n_rows": int(len(X)),
                          "n_glodap": ng, "n_bgc_argo": na,
                          "per_source_max": args.per_source_max,
+                         "surface_chla": surface_chla, "surface_chla_log": surface_chla_log,
                          "log_target": False, "include_season": False,
                          "cv_rmse_mean": float(rmses.mean()), "cv_r2_mean": float(r2s.mean()),
                          "cv_r2_std": float(r2s.std()), "cv_block_deg": args.block_deg,

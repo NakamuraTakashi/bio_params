@@ -5,6 +5,7 @@ description = "GLODAP海洋生物地球化学パラメータ予測モデル（RO
 requires-python = ">=3.12"
 dependencies = [
     "cartopy>=0.25.0",
+    "copernicusmarine>=2.4.1",
     "gsw>=3.6.21",
     "matplotlib>=3.10.9",
     "netcdf4>=1.7.4",

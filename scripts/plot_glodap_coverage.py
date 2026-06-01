@@ -7,9 +7,12 @@ columns.
 
 Usage:
     uv run python scripts/plot_glodap_coverage.py
+    # only the satellite-overlapping period (GlobColour MY starts 1997-09):
+    uv run python scripts/plot_glodap_coverage.py --since 1997-09-01 --targets Chla
 """
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import matplotlib
@@ -94,37 +97,67 @@ def in_extent(lon, lat, extent):
     return (lon >= lo0) & (lon <= lo1) & (lat >= la0) & (lat <= la1)
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--since", default=None,
+                   help="Keep only observations on/after this date (YYYY-MM-DD), "
+                        "e.g. 1997-09-01 for the satellite-overlapping period")
+    p.add_argument("--targets", nargs="+", default=list(TARGET_COLUMNS),
+                   choices=list(TARGET_COLUMNS))
+    return p.parse_args()
+
+
 def main() -> int:
+    args = parse_args()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     if not _HAS_CARTOPY:
         print("WARNING: cartopy unavailable; maps will have no coastlines")
 
-    # Read coordinates + every target value/flag column once.
+    since = pd.Timestamp(args.since) if args.since else None
+    sfx = f"_since{since:%Y%m}" if since is not None else ""
+    period = f" since {since:%Y-%m}" if since is not None else ""
+
+    # Read coordinates + every target value/flag column once (+ date if needed).
     usecols = ["G2latitude", "G2longitude"]
     for val, flag in TARGET_COLUMNS.values():
         usecols += [val, flag]
+    if since is not None:
+        usecols += ["G2year", "G2month", "G2day"]
     usecols = [c for c in dict.fromkeys(usecols)]  # dedup, keep order
     print(f"Reading {CSV} ...")
     df = pd.read_csv(CSV, usecols=usecols, low_memory=False).replace(MISSING_SENTINEL, np.nan)
     print(f"  rows: {len(df):,}")
 
-    for tgt, (val, flag) in TARGET_COLUMNS.items():
+    time = None
+    if since is not None:
+        parts = pd.DataFrame({
+            "year": pd.to_numeric(df["G2year"], errors="coerce"),
+            "month": pd.to_numeric(df["G2month"], errors="coerce"),
+            "day": pd.to_numeric(df["G2day"], errors="coerce").fillna(15).clip(1, 28),
+        })
+        parts.loc[~parts["month"].between(1, 12), "month"] = np.nan
+        time = pd.to_datetime(parts, errors="coerce")
+
+    for tgt in args.targets:
+        val, flag = TARGET_COLUMNS[tgt]
         good = (df[flag] == 2) & df[val].notna() & df["G2latitude"].notna() & df["G2longitude"].notna()
+        if since is not None:
+            good = good & time.notna() & (time >= since)
         lon = df.loc[good, "G2longitude"].to_numpy()
         lat = df.loc[good, "G2latitude"].to_numpy()
         color = COLORS.get(tgt, "tab:blue")
-        print(f"{tgt}: {len(lon):,} good points")
+        print(f"{tgt}{period}: {len(lon):,} good points")
 
         plot_map(
             lon, lat, color=color,
-            title=f"GLODAP {tgt} observations (global)  n={len(lon):,}  (flag==2)",
-            out_path=OUT_DIR / f"coverage_{tgt}.png",
+            title=f"GLODAP {tgt} observations (global){period}  n={len(lon):,}  (flag==2)",
+            out_path=OUT_DIR / f"coverage_{tgt}{sfx}.png",
         )
         m = in_extent(lon, lat, JAPAN_EXTENT)
         plot_map(
             lon[m], lat[m], color=color,
-            title=f"GLODAP {tgt} near Japan  n={int(m.sum()):,}  (flag==2)",
-            out_path=OUT_DIR / f"coverage_{tgt}_japan.png",
+            title=f"GLODAP {tgt} near Japan{period}  n={int(m.sum()):,}  (flag==2)",
+            out_path=OUT_DIR / f"coverage_{tgt}_japan{sfx}.png",
             extent=JAPAN_EXTENT, point_size=6, alpha=0.5,
         )
 

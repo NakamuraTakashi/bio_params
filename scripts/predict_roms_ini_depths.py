@@ -36,6 +36,7 @@ import torch
 
 from bio_params.features import build_features
 from bio_params.persist import load_artifact
+from bio_params.profiles import sigma0
 
 INI = Path("/mnt/d/COAWST_DATA/FORP_Kuroshio/Ini/Kuro_Ini_FORP_Nz30_20060102.00.nc")
 GRID = Path("/mnt/d/COAWST_DATA/FORP_Kuroshio/Grid/forp-kuroshio_grd_v0.0.nc")
@@ -43,6 +44,11 @@ MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "pretrained"
 OUT_DIR = Path(__file__).resolve().parent.parent / "figures" / "roms_ini_pred"
 
 TARGET_DEPTHS = [0.0, 200.0, 500.0, 1000.0, 3000.0]
+
+# Satellite surface Chl-a, for SOCA-style models that carry a surface_chla
+# feature. We feed the GlobColour monthly CHL of the ini month, sampled to the
+# ROMS grid, as the surface "truth" that anchors the predicted profile.
+SAT_DATASET = "cmems_obs-oc_glo_bgc-plankton_my_l4-multi-4km_P1M"
 
 # Display metadata per tracer. Units differ: nutrients/carbon are umol/kg,
 # Chla is mg/m3, and the isotope ratios C13/O18 are in per mil.
@@ -135,6 +141,77 @@ def interp_to_depth(data, z, target_z):
     return np.where(valid, out, np.nan)
 
 
+def _ini_month(path: Path) -> str:
+    """Parse the YYYY-MM month from an ini filename like ..._20060102.00.nc."""
+    import re
+    m = re.search(r"(\d{4})(\d{2})(\d{2})", path.name)
+    if not m:
+        raise ValueError(f"cannot parse a date from {path.name}")
+    return f"{m.group(1)}-{m.group(2)}"
+
+
+def _nearest_index(coord, axis):
+    """Nearest grid index for `coord` on a uniform (monotone) `axis`."""
+    origin = float(axis[0])
+    step = float(axis[1] - axis[0])
+    idx = np.rint((coord - origin) / step).astype(np.int64)
+    return np.clip(idx, 0, len(axis) - 1)
+
+
+def load_roms_surface_chla(lat, lon, month, dataset_id=SAT_DATASET):
+    """Satellite surface Chl-a (mg/m3) on the ROMS rho grid for `month`.
+
+    Opens the GlobColour monthly product lazily, samples the nearest pixel to
+    each (lat, lon) ROMS point, and fills cloud-masked gaps with the nearest
+    valid ROMS point so the anchor field is complete (boundary conditions need
+    no holes). Returns a 2D array shaped like `lat`/`lon`.
+    """
+    import copernicusmarine as cm
+    ds = cm.open_dataset(dataset_id=dataset_id)
+    lat_axis = ds["latitude"].values
+    lon_axis = ds["longitude"].values
+    arr = np.asarray(ds["CHL"].sel(time=f"{month}-01", method="nearest").load().values)
+    ds.close()
+
+    ilat = _nearest_index(lat.ravel(), lat_axis)
+    ilon = _nearest_index(((lon.ravel() + 180) % 360) - 180, lon_axis)
+    field = arr[ilat, ilon].reshape(lat.shape)
+
+    # Fill cloud-masked NaNs with the nearest valid ROMS pixel (KD-tree).
+    bad = ~np.isfinite(field)
+    if bad.any() and (~bad).any():
+        from scipy.spatial import cKDTree
+        good = ~bad
+        tree = cKDTree(np.column_stack([lon[good], lat[good]]))
+        _, j = tree.query(np.column_stack([lon[bad], lat[bad]]))
+        field[bad] = field[good][j]
+    return field
+
+
+def compute_mld_field(temp, salt, z_rho, lat, threshold=0.03, ref_depth=10.0):
+    """Mixed-layer depth (m) per ROMS water column from the full T/S profile.
+
+    Mirrors bio_params.profiles.add_mld (density threshold from the level
+    nearest ref_depth); returns a 2D (J, I) field, NaN over land/all-invalid.
+    """
+    N, J, I = temp.shape
+    d = (-z_rho)                       # positive depth, index 0 = deepest
+    lat3 = np.broadcast_to(lat[None], (N, J, I))
+    sig = sigma0(salt.ravel(), temp.ravel(), d.ravel(), lat3.ravel()).reshape(N, J, I)
+    finite = np.isfinite(sig) & np.isfinite(d)
+    dd = np.where(finite, np.abs(d - ref_depth), np.inf)
+    iref = np.argmin(dd, axis=0)                              # (J, I)
+    ref_sig = np.take_along_axis(sig, iref[None], axis=0)[0]  # (J, I)
+    level = np.arange(N)[:, None, None]
+    exceeded = finite & (level > iref[None]) & (sig > ref_sig[None] + threshold)
+    any_ex = exceeded.any(axis=0)
+    first = exceeded.argmax(axis=0)                           # 0 if none
+    mld = np.take_along_axis(d, first[None], axis=0)[0]
+    deepest = np.where(finite, d, -np.inf).max(axis=0)
+    mld = np.where(any_ex, mld, deepest)
+    return np.where(finite.any(axis=0), mld, np.nan)
+
+
 def predict_field(model, normalizer, X, device, log_target=False,
                   clip=None, batch=200_000):
     model.eval()
@@ -187,15 +264,20 @@ def parse_args():
     p.add_argument("--low-sal-regression", action="store_true",
                    help="Blend NO3/PO4 with the salinity mixing-line regression "
                         "at low salinity instead of leaving the MLP extrapolation")
+    p.add_argument("--tag", default=None,
+                   help="Artifact suffix, e.g. --tag satchl loads "
+                        "<source>_<target>_satchl.pt (SOCA satellite-anchored)")
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    out_dir = OUT_DIR if args.source == "glodap" else OUT_DIR.parent / f"roms_ini_pred_{args.source}"
+    tag_suffix = f"_{args.tag}" if args.tag else ""
+    base_name = f"roms_ini_pred_{args.source}{tag_suffix}" if (args.source != "glodap" or args.tag) else "roms_ini_pred"
+    out_dir = OUT_DIR if base_name == "roms_ini_pred" else OUT_DIR.parent / base_name
     out_dir.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device: {device}  source: {args.source}")
+    print(f"device: {device}  source: {args.source}{tag_suffix}")
 
     import xarray as xr
     ds = xr.open_dataset(INI, decode_times=False)
@@ -242,28 +324,77 @@ def main() -> int:
         })
         X = build_features(feat_df).to_numpy()
         per_depth.append(dict(
-            label=label, valid=valid, jj=jj, ii=ii, X=X,
+            label=label, valid=valid, jj=jj, ii=ii, X=X, feat_df=feat_df,
             low_sal=(S2 < SALT_OPEN_OCEAN_MIN),
             salinity_pts=S2[jj, ii],
         ))
 
+    # Lazily-loaded satellite surface Chl-a field and MLD field (if a model needs them).
+    sat_field = {"loaded": False, "data": None}
+    mld_field = {"loaded": False, "data": None}
+
     for tgt in args.targets:
-        art = MODEL_DIR / f"{args.source}_{tgt}.pt"
+        art = MODEL_DIR / f"{args.source}_{tgt}{tag_suffix}.pt"
         if not art.exists():
             print(f"skip {tgt}: artifact missing ({art})")
             continue
         model, normalizer, meta = load_artifact(art, map_location=device)
         model.to(device)
         extra = meta["extra"]
-        cv_r2 = extra.get("cv_r2_mean")
+        cv_r2 = (extra.get("cv_r2_mean") or extra.get("cv_abs_r2_mean")
+                 or extra.get("cv_shape_r2_mean") or float("nan"))
         log_target = bool(extra.get("log_target", False))
         if extra.get("include_season"):
             print(f"skip {tgt}: model needs season features (no time on ROMS ini)")
             continue
+        surface_chla = bool(extra.get("surface_chla", False))
+        surface_chla_log = bool(extra.get("surface_chla_log", True))
+        include_mld = bool(extra.get("include_mld", False))
+        relative_target = bool(extra.get("relative_target", False))
+        rel_cap = float(extra.get("rel_cap", 20.0))
+        # Relative models multiply by the satellite surface field for amplitude.
+        need_sat = surface_chla or relative_target
+        if need_sat and not sat_field["loaded"]:
+            month = _ini_month(INI)
+            print(f"  loading satellite surface Chl-a ({SAT_DATASET}, {month}) ...")
+            sat_field["data"] = load_roms_surface_chla(lat, lon, month)
+            sat_field["loaded"] = True
+        if include_mld and not mld_field["loaded"]:
+            print("  computing mixed-layer depth field ...")
+            mld_field["data"] = compute_mld_field(temp, salt, z_rho, lat)
+            mld_field["loaded"] = True
         m = TRACER_META[tgt]
         use_reg = args.low_sal_regression and tgt in SALINITY_REGRESSION
         print(f"{tgt}: CV R2={cv_r2:.4f}  log_target={log_target}"
+              + ("  [relative profile x satellite]" if relative_target else "")
+              + ("  [satellite surface anchor]" if surface_chla and not relative_target else "")
+              + ("  [+MLD]" if include_mld else "")
               + ("  [low-sal regression blend ON]" if use_reg else ""))
+
+        def _build_X(pd_):
+            if not (surface_chla or include_mld):
+                return pd_["X"]
+            df2 = pd_["feat_df"].copy()
+            if surface_chla:
+                df2["surface_chla"] = sat_field["data"][pd_["jj"], pd_["ii"]]
+            if include_mld:
+                df2["mld"] = mld_field["data"][pd_["jj"], pd_["ii"]]
+            return build_features(df2, include_surface_chla=surface_chla,
+                                  surface_chla_log=surface_chla_log,
+                                  include_mld=include_mld).to_numpy()
+
+        # For relative models, re-anchor the predicted profile to its own
+        # predicted surface so the surface maps EXACTLY to the satellite value
+        # (a regression does not output rel==1 at the surface by itself).
+        rel_surf = None
+        if relative_target:
+            ps = per_depth[0]  # TARGET_DEPTHS[0] == 0.0 -> surface
+            r0 = np.clip(predict_field(model, normalizer, _build_X(ps), device,
+                                       clip=None), 0.0, rel_cap)
+            rel_surf = np.full((J, I), np.nan)
+            # Tiny floor only to avoid divide-by-zero; the surface ratio is then
+            # r0/r0 == 1 exactly (so surface maps exactly to the satellite value).
+            rel_surf[ps["jj"], ps["ii"]] = np.maximum(r0, 1e-6)
 
         fig, axes = plt.subplots(
             1, len(TARGET_DEPTHS),
@@ -272,11 +403,27 @@ def main() -> int:
         )
         for ax, pd_ in zip(axes, per_depth):
             field = np.full((J, I), np.nan)
-            pred = predict_field(model, normalizer, pd_["X"], device,
-                                 log_target=log_target, clip=m.get("clip"))
+            jj, ii = pd_["jj"], pd_["ii"]
+            X = _build_X(pd_)
+            if relative_target:
+                if pd_["label"] == "surface":
+                    # The satellite IS the surface truth (ratio == 1 by definition).
+                    pred = sat_field["data"][jj, ii].copy()
+                else:
+                    rel = np.clip(predict_field(model, normalizer, X, device, clip=None),
+                                  0.0, rel_cap)
+                    # Re-anchor to the predicted surface; clip the ratio so a tiny
+                    # predicted surface cannot blow the deep value up.
+                    rel = np.clip(rel / rel_surf[jj, ii], 0.0, rel_cap)
+                    pred = rel * sat_field["data"][jj, ii]
+                if m.get("clip") is not None:
+                    pred = np.clip(pred, m["clip"][0], m["clip"][1])
+            else:
+                pred = predict_field(model, normalizer, X, device,
+                                     log_target=log_target, clip=m.get("clip"))
             if use_reg:
                 pred, _ = blend_low_salinity(pred, pd_["salinity_pts"], tgt)
-            field[pd_["jj"], pd_["ii"]] = pred
+            field[jj, ii] = pred
 
             finite = field[np.isfinite(field)]
             vmin, vmax = (np.percentile(finite, [2, 98])

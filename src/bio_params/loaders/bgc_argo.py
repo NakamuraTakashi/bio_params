@@ -198,6 +198,27 @@ def _empty(target: str) -> pd.DataFrame:
     return pd.DataFrame({c: [] for c in cols})
 
 
+def attach_surface_chla(
+    df: pd.DataFrame, matchup_parquet: str | Path
+) -> pd.DataFrame:
+    """Add a `surface_chla` column from the satellite matchup parquet.
+
+    The matchup file (see scripts/match_satellite_chla.py) holds one row per
+    profile keyed by (latitude, longitude, time) with the GlobColour surface
+    Chl-a. Merging broadcasts that value to every level of the profile. Rows
+    whose profile was not matched (e.g. masked satellite pixel, or a date
+    beyond the satellite product) get NaN and should be dropped by the caller.
+    """
+    m = pd.read_parquet(matchup_parquet)
+    m["time"] = pd.to_datetime(m["time"])
+    out = df.copy()
+    out["time"] = pd.to_datetime(out["time"])
+    return out.merge(
+        m[["latitude", "longitude", "time", "surface_chla"]],
+        on=["latitude", "longitude", "time"], how="left",
+    )
+
+
 def load_bgc_argo(
     sprof_dir: str | Path,
     target: str,

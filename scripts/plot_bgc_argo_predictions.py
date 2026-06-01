@@ -1,17 +1,18 @@
 """Plot model predictions vs observations for a saved BGC-Argo artifact.
 
 Mirrors scripts/plot_predictions.py (GLODAP) but loads data via the BGC-Argo
-loader and honors the artifact's log_target / season flags. Produces two
-hexbin scatter plots per target:
-  figures/bgc_argo/<target>/scatter_box.png    - all rows in the Kuroshio box
-  figures/bgc_argo/<target>/scatter_japan.png  - rows inside the Japan box
+loader and honors the artifact's log_target / season / surface_chla flags.
+Produces two hexbin scatter plots per target:
+  figures/bgc_argo/<target>[_<tag>]/scatter_box.png    - all rows in the box
+  figures/bgc_argo/<target>[_<tag>]/scatter_japan.png  - rows in the Japan box
 
-NOTE: BGC-Argo here is only downloaded for the Kuroshio box (120-180E,
-10-50N), so "box" is that region, not the true global ocean. The scatter is an
-in-sample fit; the honest score is the spatial CV in the artifact (annotated).
+The scatter is an in-sample fit; the honest score is the spatial CV in the
+artifact (annotated). Use --tag to plot a tagged artifact (e.g. --tag satchl
+loads bgc_argo_<target>_satchl.pt and attaches the satellite surface feature).
 
 Usage:
     uv run python scripts/plot_bgc_argo_predictions.py --target Chla
+    uv run python scripts/plot_bgc_argo_predictions.py --target Chla --tag satchl
 """
 from __future__ import annotations
 
@@ -27,13 +28,17 @@ import numpy as np
 import torch
 
 from bio_params.features import build_features
-from bio_params.loaders.bgc_argo import available_targets, load_bgc_argo
+from bio_params.loaders.bgc_argo import (
+    attach_surface_chla, available_targets, load_bgc_argo,
+)
 from bio_params.persist import load_artifact
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SPROF_DIR = PROJECT_ROOT / "data" / "bgc_argo" / "raw" / "floats"
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / "pretrained"
 DEFAULT_FIG_DIR = PROJECT_ROOT / "figures" / "bgc_argo"
+DEFAULT_MATCHUP = (PROJECT_ROOT / "data" / "bgc_argo" / "processed"
+                   / "satchl_matchup.parquet")
 
 KUROSHIO_BOX = (120.0, 180.0, 10.0, 50.0)
 JAPAN_BOX = dict(lat_min=20.0, lat_max=50.0, lon_min=120.0, lon_max=155.0)
@@ -132,6 +137,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sprof-dir", type=Path, default=DEFAULT_SPROF_DIR)
     p.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     p.add_argument("--fig-dir", type=Path, default=DEFAULT_FIG_DIR)
+    p.add_argument("--tag", default=None,
+                   help="Artifact suffix, e.g. --tag satchl loads "
+                        "bgc_argo_<target>_satchl.pt")
+    p.add_argument("--matchup", type=Path, default=DEFAULT_MATCHUP)
     return p.parse_args()
 
 
@@ -140,7 +149,8 @@ def main() -> int:
     target = args.target
     unit = UNITS.get(target, "")
 
-    artifact_path = args.model_dir / f"bgc_argo_{target}.pt"
+    stem = f"bgc_argo_{target}" + (f"_{args.tag}" if args.tag else "")
+    artifact_path = args.model_dir / f"{stem}.pt"
     if not artifact_path.exists():
         print(f"ERROR: artifact not found at {artifact_path}")
         return 1
@@ -151,9 +161,12 @@ def main() -> int:
     log_target = bool(extra.get("log_target", False))
     include_season = bool(extra.get("include_season", False))
     include_sigma = bool(extra.get("include_sigma", False))
+    surface_chla = bool(extra.get("surface_chla", False))
+    surface_chla_log = bool(extra.get("surface_chla_log", True))
     cv_r2 = extra.get("cv_r2_mean")
     cv_rmse = extra.get("cv_rmse_mean")
-    print(f"  log_target={log_target}  season={include_season}  CV R2={cv_r2:.4f}")
+    print(f"  log_target={log_target}  season={include_season}  "
+          f"surface_chla={surface_chla}  CV R2={cv_r2:.4f}")
 
     # Use the box the model was trained on (global or Kuroshio), saved in the
     # artifact, so the scatter covers the model's actual domain.
@@ -163,8 +176,14 @@ def main() -> int:
 
     print(f"Loading {target} from BGC-Argo (box={box}) ...")
     df = load_bgc_argo(args.sprof_dir, target=target, box=box)
+    if surface_chla:
+        df = attach_surface_chla(df, args.matchup)
+        df = df[np.isfinite(df["surface_chla"])].reset_index(drop=True)
+        print(f"  rows with satellite surface Chl-a: {len(df):,}")
     feats = build_features(df, include_sigma_theta=include_sigma,
-                           include_season=include_season)
+                           include_season=include_season,
+                           include_surface_chla=surface_chla,
+                           surface_chla_log=surface_chla_log)
     X = feats.to_numpy()
     y = df[target].to_numpy()
     lat = df["latitude"].to_numpy()
@@ -176,13 +195,15 @@ def main() -> int:
     s_all = compute_stats(y, pred)
     print(f"  {box_label} in-sample: {stats_text(s_all, unit)}")
 
+    sub = target + (f"_{args.tag}" if args.tag else "")
     title_box = (
-        f"{target}: BGC-Argo model vs obs ({box_label})\n"
+        f"{target}: BGC-Argo model vs obs ({box_label})"
+        + (" +satellite surface Chl" if surface_chla else "") + "\n"
         f"{stats_text(s_all, unit)}\n"
         f"Honest spatial CV (5-fold): RMSE={cv_rmse:.3g} {unit}  R2={cv_r2:.4f}"
     )
     scatter_hexbin(y, pred, unit=unit, title=title_box,
-                   out_path=args.fig_dir / target / "scatter_box.png",
+                   out_path=args.fig_dir / sub / "scatter_box.png",
                    log_axes=log_target)
 
     mask = ((lat >= JAPAN_BOX["lat_min"]) & (lat <= JAPAN_BOX["lat_max"])
@@ -201,10 +222,10 @@ def main() -> int:
         f"{stats_text(s_jp, unit)}"
     )
     scatter_hexbin(y[mask], pred[mask], unit=unit, title=title_jp,
-                   out_path=args.fig_dir / target / "scatter_japan.png",
+                   out_path=args.fig_dir / sub / "scatter_japan.png",
                    log_axes=log_target)
 
-    print(f"\nSaved figures -> {args.fig_dir / target}/")
+    print(f"\nSaved figures -> {args.fig_dir / sub}/")
     return 0
 
 

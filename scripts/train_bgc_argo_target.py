@@ -5,14 +5,19 @@ bgc_argo loader and can add seasonal (day-of-year) features. BGC-Argo carries
 a real timestamp per profile, so seasonal encoding is meaningful here (unlike
 the static GLODAP models).
 
-Artifacts are written to models/pretrained/bgc_argo_<target>[_season].pt and
-CV metrics to data/bgc_argo/processed/cv_<target>[_season].json. The artifact's
-extra dict records include_season / include_sigma so inference rebuilds the
-exact feature set.
+It can also add a SOCA-style satellite surface Chl-a feature (--surface-chla),
+attached from the GlobColour matchup parquet; rows without a satellite match
+are dropped. Use --tag to suffix the artifact name so experiments do not
+clobber each other (e.g. --tag satchl -> bgc_argo_Chla_satchl.pt).
+
+Artifacts are written to models/pretrained/bgc_argo_<target>[_<tag>].pt and
+CV metrics to data/bgc_argo/processed/cv_<target>[_<tag>].json. The artifact's
+extra dict records the feature flags so inference rebuilds the exact feature set.
 
 Usage:
     uv run python scripts/train_bgc_argo_target.py --target Chla --season
-    uv run python scripts/train_bgc_argo_target.py --target Chla            # no season (baseline)
+    uv run python scripts/train_bgc_argo_target.py --target Chla \
+        --box -180 180 -90 90 --surface-chla --tag satchl
 """
 from __future__ import annotations
 
@@ -26,7 +31,9 @@ import torch
 from bio_params.cv import spatial_block_split
 from bio_params.dataset import Normalizer, TabularDataset
 from bio_params.features import build_features, feature_names
-from bio_params.loaders.bgc_argo import available_targets, load_bgc_argo
+from bio_params.loaders.bgc_argo import (
+    attach_surface_chla, available_targets, load_bgc_argo,
+)
 from bio_params.model import MLP, MLPConfig
 from bio_params.persist import save_artifact
 from bio_params.train import TrainConfig, train
@@ -35,29 +42,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SPROF_DIR = PROJECT_ROOT / "data" / "bgc_argo" / "raw" / "floats"
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / "pretrained"
 DEFAULT_METRICS_DIR = PROJECT_ROOT / "data" / "bgc_argo" / "processed"
+DEFAULT_MATCHUP = DEFAULT_METRICS_DIR / "satchl_matchup.parquet"
 
 # Kuroshio-covering box used for the BGC-Argo download/selection.
 DEFAULT_BOX = (120.0, 180.0, 10.0, 50.0)
-
-
-def evaluate(model, X_va_n, y_va, normalizer) -> dict[str, float]:
-    device = next(model.parameters()).device
-    model.eval()
-    with torch.no_grad():
-        pred_n = model(
-            torch.from_numpy(X_va_n.astype(np.float32)).to(device)
-        ).cpu().numpy()
-    pred = normalizer.inverse_transform_y(pred_n)
-    err = pred - y_va
-    ss_res = float((err ** 2).sum())
-    ss_tot = float(((y_va - y_va.mean()) ** 2).sum())
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-    return {
-        "rmse": float(np.sqrt((err ** 2).mean())),
-        "mae": float(np.abs(err).mean()),
-        "r2": r2,
-        "n": int(len(y_va)),
-    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,6 +58,16 @@ def parse_args() -> argparse.Namespace:
                    metavar=("LON0", "LON1", "LAT0", "LAT1"))
     p.add_argument("--season", action="store_true",
                    help="Add day-of-year (sin/cos) seasonal features")
+    p.add_argument("--surface-chla", action="store_true",
+                   help="Add SOCA-style satellite surface Chl-a feature "
+                        "(requires the matchup parquet)")
+    p.add_argument("--surface-chla-linear", action="store_true",
+                   help="Use a linear surface-Chl feature instead of log10 "
+                        "(default log10, SOCA; linear can blow up CV folds)")
+    p.add_argument("--matchup", type=Path, default=DEFAULT_MATCHUP,
+                   help="Satellite surface-Chl matchup parquet")
+    p.add_argument("--tag", default=None,
+                   help="Suffix for artifact/metrics names, e.g. --tag satchl")
     p.add_argument("--include-sigma", action="store_true")
     p.add_argument("--log-target", action="store_true",
                    help="Train on log10(target); good for Chl-a (log-normal)")
@@ -96,7 +94,12 @@ def main() -> int:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    suffix = "_season" if args.season else ""
+    if args.tag:
+        suffix = f"_{args.tag}"
+    elif args.season:
+        suffix = "_season"
+    else:
+        suffix = ""
     print(f"=== BGC-Argo target={args.target}{suffix}  spatial block CV ===")
     print(f"Loading {args.sprof_dir} ...")
     df = load_bgc_argo(args.sprof_dir, target=args.target, box=tuple(args.box))
@@ -105,17 +108,27 @@ def main() -> int:
         print("ERROR: no rows; download floats first via download_bgc_argo.py")
         return 1
 
+    if args.surface_chla:
+        df = attach_surface_chla(df, args.matchup)
+        n_before = len(df)
+        df = df[np.isfinite(df["surface_chla"])].reset_index(drop=True)
+        print(f"  {len(df):,} rows with satellite surface Chl-a "
+              f"({n_before - len(df):,} dropped: unmatched/masked/post-MY)")
+
     if args.subsample is not None and len(df) > args.subsample:
         rng = np.random.default_rng(args.seed)
         keep = rng.choice(len(df), size=args.subsample, replace=False)
         df = df.iloc[np.sort(keep)].reset_index(drop=True)
         print(f"  subsampled to {len(df):,} rows (uniform, seed={args.seed})")
 
+    surface_chla_log = not args.surface_chla_linear
     feats = build_features(
-        df, include_sigma_theta=args.include_sigma, include_season=args.season
+        df, include_sigma_theta=args.include_sigma, include_season=args.season,
+        include_surface_chla=args.surface_chla, surface_chla_log=surface_chla_log,
     )
     fnames = feature_names(
-        include_sigma_theta=args.include_sigma, include_season=args.season
+        include_sigma_theta=args.include_sigma, include_season=args.season,
+        include_surface_chla=args.surface_chla, surface_chla_log=surface_chla_log,
     )
     X = feats.to_numpy()
     y_raw = df[args.target].to_numpy()
@@ -196,6 +209,7 @@ def main() -> int:
     payload = {
         "target": args.target, "source": "bgc_argo",
         "include_season": args.season, "include_sigma": args.include_sigma,
+        "surface_chla": args.surface_chla, "surface_chla_log": surface_chla_log,
         "log_target": args.log_target, "box": list(args.box),
         "n_folds": args.folds, "block_deg": args.block_deg,
         "feature_names": fnames, "n_rows": int(len(X)),
@@ -231,6 +245,7 @@ def main() -> int:
         extra={
             "source": "bgc_argo", "n_rows": int(len(X)),
             "include_season": args.season, "include_sigma": args.include_sigma,
+            "surface_chla": args.surface_chla, "surface_chla_log": surface_chla_log,
             "log_target": args.log_target, "box": list(args.box),
             "cv_rmse_mean": float(rmses.mean()), "cv_rmse_std": float(rmses.std()),
             "cv_r2_mean": float(r2s.mean()), "cv_r2_std": float(r2s.std()),
