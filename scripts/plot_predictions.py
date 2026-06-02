@@ -29,6 +29,7 @@ import torch
 from bio_params.features import build_features
 from bio_params.loaders.glodap import available_targets, load_glodap
 from bio_params.persist import load_artifact
+from bio_params.profiles import add_mld
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CSV = PROJECT_ROOT / "data" / "glodap" / "raw" / "GLODAPv2.2023_Merged_Master_File.csv"
@@ -139,6 +140,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fig-dir", type=Path, default=DEFAULT_FIG_DIR)
     p.add_argument("--unit", default="umol/kg",
                    help="Unit label for axes (e.g. umol/kg, umol/L, mg/L)")
+    p.add_argument("--tag", default=None,
+                   help="Artifact suffix, e.g. --tag mld loads glodap_<target>_mld.pt "
+                        "and writes scatter_global_<tag>.png (keeps the base figures)")
     return p.parse_args()
 
 
@@ -146,7 +150,8 @@ def main() -> int:
     args = parse_args()
     target = args.target
 
-    artifact_path = args.model_dir / f"glodap_{target}.pt"
+    sfx = f"_{args.tag}" if args.tag else ""
+    artifact_path = args.model_dir / f"glodap_{target}{sfx}.pt"
     if not artifact_path.exists():
         print(f"ERROR: artifact not found at {artifact_path}")
         print(f"Run: uv run python scripts/train_target.py --target {target}")
@@ -154,14 +159,21 @@ def main() -> int:
 
     print(f"Loading model: {artifact_path}")
     model, normalizer, meta = load_artifact(artifact_path)
-    cv_rmse = meta["extra"].get("cv_rmse_mean")
-    cv_r2 = meta["extra"].get("cv_r2_mean")
-    include_sigma = bool(meta["extra"].get("include_sigma", False))
-    print(f"  CV (honest reference): RMSE={cv_rmse:.3g}  R²={cv_r2:.4f}")
+    extra = meta["extra"]
+    cv_rmse = extra.get("cv_rmse_mean")
+    cv_r2 = extra.get("cv_r2_mean")
+    include_sigma = bool(extra.get("include_sigma", False))
+    include_mld = bool(extra.get("include_mld", False))
+    aou = bool(extra.get("aou_decomposition", False))
+    print(f"  CV (honest reference): RMSE={cv_rmse:.3g}  R²={cv_r2:.4f}"
+          + ("  [+MLD]" if include_mld else "") + ("  [AOU->O2]" if aou else ""))
 
     print(f"Loading {target} from CSV ...")
-    df = load_glodap(args.csv, target=target)
-    feats = build_features(df, include_sigma_theta=include_sigma)
+    df = load_glodap(args.csv, target=target, with_time=include_mld)
+    if include_mld:
+        df = add_mld(df)
+        df = df[np.isfinite(df["mld"])].reset_index(drop=True)
+    feats = build_features(df, include_sigma_theta=include_sigma, include_mld=include_mld)
     X = feats.to_numpy()
     y = df[target].to_numpy()
     lat = df["latitude"].to_numpy()
@@ -170,6 +182,11 @@ def main() -> int:
 
     print("Predicting ...")
     pred = predict_all(model, normalizer, X)
+    if aou:
+        # Model predicts AOU; reconstruct O2 = O2sat(T,S) - AOU.
+        import gsw
+        o2s = gsw.O2sol_SP_pt(df["salinity"].to_numpy(), df["temperature"].to_numpy())
+        pred = o2s - pred
     s_all = compute_stats(y, pred)
     print(f"  global in-sample: {stats_text(s_all, args.unit)}")
 
@@ -181,7 +198,7 @@ def main() -> int:
     scatter_hexbin(
         y, pred,
         unit=args.unit, title=title_global,
-        out_path=args.fig_dir / target / "scatter_global.png",
+        out_path=args.fig_dir / target / f"scatter_global{sfx}.png",
     )
 
     mask = japan_mask(lat, lon)
@@ -202,10 +219,10 @@ def main() -> int:
     scatter_hexbin(
         y[mask], pred[mask],
         unit=args.unit, title=title_jp,
-        out_path=args.fig_dir / target / "scatter_japan.png",
+        out_path=args.fig_dir / target / f"scatter_japan{sfx}.png",
     )
 
-    print(f"\nSaved figures -> {args.fig_dir / target}/")
+    print(f"\nSaved figures -> {args.fig_dir / target}/ (scatter_*{sfx}.png)")
     return 0
 
 

@@ -68,6 +68,9 @@ def parse_args():
     p.add_argument("--ik-head", action="store_true",
                    help="learn a per-sample (environment-dependent) Ik via a 2nd "
                         "MLP output instead of one global Ik")
+    p.add_argument("--fixed-ze", type=float, default=None,
+                   help="TEST: fix euphotic depth Ze (m) constant (Kd=ln(100)/Ze) "
+                        "instead of Morel(surface Chl); opens the gate deeper")
     p.add_argument("--tag", default=None)
     return p.parse_args()
 
@@ -174,7 +177,11 @@ def main() -> int:
     df = add_mld(df)
     df = add_relative_target(df, "Chla", rel_cap=args.rel_cap)
     df = df[np.isfinite(df["mld"]) & np.isfinite(df["NO3"])].reset_index(drop=True)
-    df["kd"] = kd_from_surface_chl(df["Chla_surf"].to_numpy())
+    if args.fixed_ze:
+        df["kd"] = np.full(len(df), np.log(100.0) / args.fixed_ze)
+        print(f"  TEST: fixed Ze={args.fixed_ze:.0f} m -> Kd={np.log(100.0)/args.fixed_ze:.4f} /m (constant)")
+    else:
+        df["kd"] = kd_from_surface_chl(df["Chla_surf"].to_numpy())
 
     if args.per_source_profiles and "source" in df.columns:
         keys = ["latitude", "longitude", "time"]; rng = np.random.default_rng(args.seed)
@@ -252,6 +259,7 @@ def main() -> int:
                   extra=dict(source=args.source, output_gate=True, relative_target=True,
                              gate="tanh(rel_light/Ik)", gate_ik=float(ik_final),
                              ik_head=args.ik_head, gate_ik_ref=IK_REF,
+                             gate_fixed_ze=args.fixed_ze,
                              include_mld=True, include_no3=True, rel_cap=args.rel_cap,
                              log_target=False, include_season=False,
                              cv_shape_r2_mean=float(sr2.mean()), cv_abs_r2_mean=float(ar2.mean()),

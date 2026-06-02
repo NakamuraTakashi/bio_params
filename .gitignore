@@ -14,8 +14,10 @@ env/
 # Data: 原本・前処理済みはコミットしない（README と .gitkeep のみ管理）
 data/**/raw/*
 data/**/processed/*
+data/**/climatology/*
 !data/**/raw/.gitkeep
 !data/**/processed/.gitkeep
+!data/**/climatology/.gitkeep
 
 # IDE / Editor
 .vscode/

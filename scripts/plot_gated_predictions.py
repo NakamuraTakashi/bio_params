@@ -41,7 +41,7 @@ def r2_log(obs, pred):
     return 1.0 - ss / tot if tot > 0 else float("nan")
 
 
-def scatter(ax, obs, pred, title, log_axes=True):
+def scatter(ax, obs, pred, title, log_axes=True, lin_max=None):
     if log_axes:
         lo = max(1e-3, float(min(obs.min(), pred.min())))
         hi = float(max(obs.max(), pred.max()))
@@ -49,7 +49,7 @@ def scatter(ax, obs, pred, title, log_axes=True):
         kw = dict(xscale="log", yscale="log")
     else:
         lo = 0.0
-        hi = float(np.percentile(np.concatenate([obs, pred]), 99))
+        hi = float(lin_max) if lin_max else float(np.percentile(np.concatenate([obs, pred]), 99))
         extent = (lo, hi, lo, hi); kw = {}
     hb = ax.hexbin(obs, pred, gridsize=70, bins="log", cmap="viridis",
                    mincnt=1, extent=extent, **kw)
@@ -64,9 +64,17 @@ def scatter(ax, obs, pred, title, log_axes=True):
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--source", default="combined")
+    p.add_argument("--source", default="combined", help="model source (artifact prefix)")
     p.add_argument("--tag", default="gated")
+    p.add_argument("--eval-source", default=None,
+                   help="data source to validate against (default = --source). "
+                        "Use 'glodap' for absolute validation (GLODAP surface "
+                        "matches satellite; BGC-Argo is biased in absolute terms).")
+    p.add_argument("--linear-max", type=float, nargs="+", default=None,
+                   help="upper limit(s) for the linear-axis scatter; one figure per "
+                        "value, named ..._linear_max<N>.png (e.g. --linear-max 20 10 5)")
     args = p.parse_args()
+    eval_source = args.eval_source or args.source
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -77,11 +85,17 @@ def main() -> int:
     print(f"loaded {art.name}  Ik={ik:.4f}  ik_head={ik_head}  "
           f"shape CV R2={e.get('cv_shape_r2_mean'):.4f}")
 
-    df = load_chla_no3(args.source, glodap_csv=CSV, sprof_dir=SPROF)
+    print(f"  evaluating against {eval_source} observations")
+    df = load_chla_no3(eval_source, glodap_csv=CSV, sprof_dir=SPROF)
     df = add_mld(df)
     df = add_relative_target(df, "Chla", rel_cap=rel_cap)
     df = df[np.isfinite(df["mld"]) & np.isfinite(df["NO3"])].reset_index(drop=True)
-    df["kd"] = kd_from_surface_chl(df["Chla_surf"].to_numpy())
+    fixed_ze = e.get("gate_fixed_ze")
+    if fixed_ze:
+        df["kd"] = np.full(len(df), np.log(100.0) / float(fixed_ze))
+        print(f"  fixed Ze={float(fixed_ze):.0f} m -> Kd={np.log(100.0)/float(fixed_ze):.4f} /m")
+    else:
+        df["kd"] = kd_from_surface_chl(df["Chla_surf"].to_numpy())
 
     X = build_features(df, include_mld=True, include_no3=True).to_numpy()
     Xn = norm.transform_x(X).astype(np.float32)
@@ -116,17 +130,26 @@ def main() -> int:
         stats[lbl] = (mask, r2, rmse)
         print(f"  {lbl}: n={mask.sum():,}  log-R2(obs>={PROD_THR})={r2:.4f}  RMSE={rmse:.3g}")
 
-    for log_axes, fname in [(True, f"scatter_{args.source}_{args.tag}.png"),
-                            (False, f"scatter_{args.source}_{args.tag}_linear.png")]:
+    evsfx = f"_eval-{eval_source}" if eval_source != args.source else ""
+    base = f"scatter_{args.source}_{args.tag}{evsfx}"
+    # One log-axis figure, then one linear figure per requested upper limit
+    # (distinct filename per limit so earlier figures are not overwritten).
+    panels = [(True, None, f"{base}.png")]
+    for lm in (args.linear_max if args.linear_max else [None]):
+        sfx = "_linear" if lm is None else f"_linear_max{int(lm)}"
+        panels.append((False, lm, f"{base}{sfx}.png"))
+
+    for log_axes, lin_max, fname in panels:
         fig, axes = plt.subplots(1, 2, figsize=(13, 6.2))
         for ax, lbl in zip(axes, ["global", "Japan box"]):
             mask, r2, rmse = stats[lbl]
-            axt = "log-log" if log_axes else "linear"
+            axt = "log-log" if log_axes else f"linear 0-{int(lin_max)}" if lin_max else "linear"
             scatter(ax, obs[mask], pred_plot[mask],
-                    f"{args.source}_{args.tag} ({lbl}, {axt})\n"
+                    f"{args.source}_{args.tag} vs {eval_source} obs ({lbl}, {axt})\n"
                     f"n={mask.sum():,}  log-R2(Chl>={PROD_THR})={r2:.3f}  "
-                    f"RMSE={rmse:.3g} mg/m3", log_axes=log_axes)
-        fig.suptitle("Gated relative Chl-a: model (rel x in-situ surface) vs observation",
+                    f"RMSE={rmse:.3g} mg/m3", log_axes=log_axes, lin_max=lin_max)
+        fig.suptitle(f"Gated relative Chl-a ({args.source}_{args.tag}): "
+                     f"model (rel x in-situ surface) vs {eval_source} observation",
                      fontsize=12)
         fig.tight_layout()
         fig.savefig(OUT_DIR / fname, dpi=120, bbox_inches="tight"); plt.close(fig)

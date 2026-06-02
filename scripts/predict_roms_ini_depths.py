@@ -165,13 +165,14 @@ def load_roms_surface_chla(lat, lon, month, dataset_id=SAT_DATASET):
     each (lat, lon) ROMS point, and fills cloud-masked gaps with the nearest
     valid ROMS point so the anchor field is complete (boundary conditions need
     no holes). Returns a 2D array shaped like `lat`/`lon`.
+
+    Uses the local NetCDF archive (data/satellite/raw/) if present, else the
+    remote GlobColour product; for months outside the archive range it falls
+    back to the monthly climatology (data/satellite/climatology/).
     """
-    import copernicusmarine as cm
-    ds = cm.open_dataset(dataset_id=dataset_id)
-    lat_axis = ds["latitude"].values
-    lon_axis = ds["longitude"].values
-    arr = np.asarray(ds["CHL"].sel(time=f"{month}-01", method="nearest").load().values)
-    ds.close()
+    from bio_params.satellite import chla_month_field
+    lat_axis, lon_axis, arr, src = chla_month_field(month, dataset_id=dataset_id)
+    print(f"  satellite source: {src}")
 
     ilat = _nearest_index(lat.ravel(), lat_axis)
     ilon = _nearest_index(((lon.ravel() + 180) % 360) - 180, lon_axis)
