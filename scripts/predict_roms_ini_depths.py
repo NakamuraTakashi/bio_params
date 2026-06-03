@@ -36,6 +36,7 @@ import torch
 
 from bio_params.features import build_features
 from bio_params.persist import load_artifact
+from bio_params.base_profile import BaseProfile
 from bio_params.profiles import daily_insolation_factor, sigma0
 
 INI = Path("/mnt/d/COAWST_DATA/FORP_Kuroshio/Ini/Kuro_Ini_FORP_Nz30_20060102.00.nc")
@@ -408,6 +409,12 @@ def main() -> int:
         ik_head = bool(extra.get("ik_head", False))
         gate_ik_ref = float(extra.get("gate_ik_ref", 0.02))
         seasonal_light = bool(extra.get("seasonal_light", False))
+        base_amp = bool(extra.get("base_amp", False))
+        a_max = float(extra.get("a_max", 5.0))
+        base_profile = BaseProfile.from_dict(extra["base_profile"]) if base_amp else None
+        # models that force deep->0 by construction (no productive-layer taper,
+        # surface == satellite): the light gate and the base x amplification model.
+        structural = output_gate or base_amp
         rel_cap = float(extra.get("rel_cap", 20.0))
         # Relative models multiply by the satellite surface field for amplitude.
         need_sat = surface_chla or relative_target
@@ -429,6 +436,7 @@ def main() -> int:
         use_reg = args.low_sal_regression and tgt in SALINITY_REGRESSION
         print(f"{tgt}: CV R2={cv_r2:.4f}  log_target={log_target}"
               + ("  [relative profile x satellite]" if relative_target else "")
+              + ("  [base x amplification]" if base_amp else "")
               + ("  [satellite surface anchor]" if surface_chla and not relative_target else "")
               + ("  [+MLD]" if include_mld else "")
               + ("  [low-sal regression blend ON]" if use_reg else ""))
@@ -456,19 +464,26 @@ def main() -> int:
                                   include_mld=include_mld,
                                   include_no3=include_no3).to_numpy()
 
-        def _gated_rel(pd_):
-            # rel = softplus(g) * tanh(rel_light/Ik); rel_light = exp(-Kd*z),
-            # Kd from satellite surface Chl. -> 0 in the dark for any Ik. With an
-            # Ik head the model outputs (g, Ik) per sample; else Ik is global.
+        def _struct_rel(pd_):
+            # Relative profile for models that force deep->0 structurally.
+            # base_amp: rel = base(z; sat surface Chl) * A_max*sigmoid(MLP), with
+            #   the data-derived typical base decaying to 0 (bounded a => deep->0).
+            # gate: rel = softplus(g) * tanh(rel_light/Ik); rel_light = exp(-Kd*z),
+            #   Kd from satellite surface Chl -> 0 in the dark for any Ik.
             jj, ii = pd_["jj"], pd_["ii"]
+            depth = pd_["feat_df"]["depth"].to_numpy()
             out = predict_field(model, normalizer, _build_X(pd_), device, clip=None)
+            if base_amp:
+                a = a_max * (1.0 / (1.0 + np.exp(-out)))
+                base_col = base_profile.eval(sat_field["data"][jj, ii], depth)
+                return np.clip(base_col * a, 0.0, rel_cap)
             if ik_head:
                 g = np.logaddexp(0.0, out[:, 0])                      # softplus
                 ik = gate_ik_ref * np.exp(np.clip(out[:, 1], -5.0, 5.0))
             else:
                 g = np.logaddexp(0.0, out); ik = gate_ik
             kd = np.log(100.0) / morel_euphotic_depth(sat_field["data"][jj, ii])
-            rl = np.exp(-kd * pd_["feat_df"]["depth"].to_numpy())
+            rl = np.exp(-kd * depth)
             if seasonal_light:
                 rl = daily_insolation_factor(lat[jj, ii], _ini_doy(INI)) * rl
             return np.clip(g * np.tanh(rl / ik), 0.0, rel_cap)
@@ -480,16 +495,16 @@ def main() -> int:
         zp_field = None
         if relative_target:
             ps = per_depth[0]  # TARGET_DEPTHS[0] == 0.0 -> surface
-            r0 = (_gated_rel(ps) if output_gate
+            r0 = (_struct_rel(ps) if structural
                   else np.clip(predict_field(model, normalizer, _build_X(ps), device,
                                              clip=None), 0.0, rel_cap))
             rel_surf = np.full((J, I), np.nan)
             # Tiny floor only to avoid divide-by-zero; the surface ratio is then
             # r0/r0 == 1 exactly (so surface maps exactly to the satellite value).
             rel_surf[ps["jj"], ps["ii"]] = np.maximum(r0, 1e-6)
-            # Non-gated relative models need the productive-layer taper to kill
-            # deep Chl; the gated model handles that structurally (no taper).
-            if not output_gate:
+            # Plain relative models need the productive-layer taper to kill deep
+            # Chl; structural models (gate / base x amp) handle it by construction.
+            if not structural:
                 zp_field = np.fmax(morel_euphotic_depth(sat_field["data"]),
                                    mld_field["data"])
 
@@ -507,14 +522,14 @@ def main() -> int:
                     # The satellite IS the surface truth (ratio == 1 by definition).
                     pred = sat_field["data"][jj, ii].copy()
                 else:
-                    rel = _gated_rel(pd_) if output_gate else np.clip(
+                    rel = _struct_rel(pd_) if structural else np.clip(
                         predict_field(model, normalizer, X, device, clip=None),
                         0.0, rel_cap)
                     # Re-anchor to the predicted surface; clip the ratio so a tiny
                     # predicted surface cannot blow the deep value up.
                     rel = np.clip(rel / rel_surf[jj, ii], 0.0, rel_cap)
                     pred = rel * sat_field["data"][jj, ii]
-                    if not output_gate:
+                    if not structural:
                         # Productive-layer taper: Chl -> 0 below the euphotic/mixed
                         # layer (the gated model achieves this structurally instead).
                         pred = pred * productive_taper(
