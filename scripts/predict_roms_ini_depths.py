@@ -153,11 +153,16 @@ def _ini_month(path: Path) -> str:
 
 def _ini_doy(path: Path) -> int:
     """Day-of-year from an ini filename like ..._20060102.00.nc (for E0)."""
+    return int(pd.Timestamp(_ini_date(path)).dayofyear)
+
+
+def _ini_date(path: Path) -> str:
+    """YYYY-MM-DD from an ini filename like ..._20060102.00.nc."""
     import re
     m = re.search(r"(\d{4})(\d{2})(\d{2})", path.name)
     if not m:
         raise ValueError(f"cannot parse a date from {path.name}")
-    return int(pd.Timestamp(f"{m.group(1)}-{m.group(2)}-{m.group(3)}").dayofyear)
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
 
 
 def _nearest_index(coord, axis):
@@ -168,20 +173,26 @@ def _nearest_index(coord, axis):
     return np.clip(idx, 0, len(axis) - 1)
 
 
-def load_roms_surface_chla(lat, lon, month, dataset_id=SAT_DATASET):
-    """Satellite surface Chl-a (mg/m3) on the ROMS rho grid for `month`.
+def load_roms_surface_chla(lat, lon, month, dataset_id=SAT_DATASET,
+                           kind="monthly", date=None):
+    """Satellite surface Chl-a (mg/m3) on the ROMS rho grid.
 
-    Opens the GlobColour monthly product lazily, samples the nearest pixel to
-    each (lat, lon) ROMS point, and fills cloud-masked gaps with the nearest
-    valid ROMS point so the anchor field is complete (boundary conditions need
-    no holes). Returns a 2D array shaped like `lat`/`lon`.
-
-    Uses the local NetCDF archive (data/satellite/raw/) if present, else the
-    remote GlobColour product; for months outside the archive range it falls
-    back to the monthly climatology (data/satellite/climatology/).
+    `kind="monthly"` uses the GlobColour monthly product for `month`
+    ("YYYY-MM"); `kind="daily"` uses the gapfree daily archive for `date`
+    ("YYYY-MM-DD"), falling back to the month if that day is missing. Samples the
+    nearest pixel to each (lat, lon) ROMS point and fills any remaining gaps with
+    the nearest valid ROMS point (boundary conditions need no holes). Returns a
+    2D array shaped like `lat`/`lon`.
     """
-    from bio_params.satellite import chla_month_field
-    lat_axis, lon_axis, arr, src = chla_month_field(month, dataset_id=dataset_id)
+    from bio_params.satellite import chla_day_field, chla_month_field
+    if kind == "daily":
+        try:
+            lat_axis, lon_axis, arr, src = chla_day_field(date)
+        except FileNotFoundError as exc:
+            print(f"  daily satellite unavailable ({exc}); falling back to monthly")
+            lat_axis, lon_axis, arr, src = chla_month_field(month, dataset_id=dataset_id)
+    else:
+        lat_axis, lon_axis, arr, src = chla_month_field(month, dataset_id=dataset_id)
     print(f"  satellite source: {src}")
 
     ilat = _nearest_index(lat.ravel(), lat_axis)
@@ -317,6 +328,10 @@ def parse_args():
     p.add_argument("--no3-model", default="combined",
                    help="NO3 model prefix used to supply the NO3 feature for "
                         "gated Chl-a models (loads <prefix>_NO3.pt)")
+    p.add_argument("--satellite", choices=["monthly", "daily"], default="monthly",
+                   help="surface Chl-a source for relative/anchored models: "
+                        "monthly product (default) or the gapfree daily archive "
+                        "(exact ini date)")
     return p.parse_args()
 
 
@@ -420,8 +435,10 @@ def main() -> int:
         need_sat = surface_chla or relative_target
         if need_sat and not sat_field["loaded"]:
             month = _ini_month(INI)
-            print(f"  loading satellite surface Chl-a ({SAT_DATASET}, {month}) ...")
-            sat_field["data"] = load_roms_surface_chla(lat, lon, month)
+            label = _ini_date(INI) if args.satellite == "daily" else month
+            print(f"  loading satellite surface Chl-a ({args.satellite}, {label}) ...")
+            sat_field["data"] = load_roms_surface_chla(
+                lat, lon, month, kind=args.satellite, date=_ini_date(INI))
             sat_field["loaded"] = True
         if include_mld and not mld_field["loaded"]:
             print("  computing mixed-layer depth field ...")

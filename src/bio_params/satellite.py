@@ -21,6 +21,31 @@ _CLIM_DIR = _ROOT / "data" / "satellite" / "climatology"
 CLIM_PATH = _CLIM_DIR / "globcolour_chl_monthly_clim.nc"            # median, gappy
 CLIM_FILLED = _CLIM_DIR / "globcolour_chl_monthly_clim_filled.nc"   # gap-free (preferred)
 
+# Daily gapfree archive mirrored on the NAS (coords lat/lon, var CHL, one file
+# per day under <root>/YYYY/MM/YYYYMMDD_..._P1D.nc). Already gap-free.
+DAILY_SAT_ROOT = Path("/mnt/w/share/Copernicus-GlobColour/OCEANCOLOUR_GLO_BGC_L4_MY_009_104"
+                      "/cmems_obs-oc_glo_bgc-plankton_my_l4-gapfree-multi-4km_P1D_202603")
+
+
+def chla_day_field(date_str: str, root: Path = DAILY_SAT_ROOT):
+    """Daily gapfree surface CHL field for `date_str` ("YYYY-MM-DD").
+
+    Reads <root>/YYYY/MM/YYYYMMDD_*_P1D.nc (coords lat/lon, var CHL) and returns
+    (lat_axis, lon_axis, arr2d, "daily"). Raises FileNotFoundError if the day is
+    not present (caller may fall back to the monthly field).
+    """
+    d = pd.Timestamp(date_str)
+    fdir = Path(root) / f"{d.year:04d}" / f"{d.month:02d}"
+    matches = sorted(fdir.glob(f"{d.year:04d}{d.month:02d}{d.day:02d}_*_P1D.nc"))
+    if not matches:
+        raise FileNotFoundError(f"no daily satellite file for {date_str} under {fdir}")
+    ds = xr.open_dataset(matches[0])
+    chl = ds["CHL"]
+    arr = np.asarray(chl.isel(time=0).values if "time" in chl.dims else chl.values)
+    lat = ds["lat"].values; lon = ds["lon"].values
+    ds.close()
+    return lat, lon, arr, "daily"
+
 
 def open_chla(dataset_id: str = SAT_DATASET, local_dir: Path = LOCAL_SAT_DIR):
     """Return (Dataset, source) where source is 'local' or 'server'.
