@@ -44,3 +44,7 @@ docs/*.pdf
 *.pdf
 # Dropbox が付与するサイドカー属性ファイル
 *:com.dropbox.attrs
+
+# CMEMS credentials (never commit)
+cmems.env
+**/cmems.env
