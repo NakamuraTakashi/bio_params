@@ -80,9 +80,9 @@ def main() -> int:
 
     art = MODEL_DIR / f"{args.source}_Chla_{args.tag}.pt"
     model, norm, meta = load_artifact(art, map_location=device); model.to(device)
-    e = meta["extra"]; ik = float(e["gate_ik"]); rel_cap = float(e.get("rel_cap", 20.0))
-    ik_head = bool(e.get("ik_head", False)); ik_ref = float(e.get("gate_ik_ref", 0.02))
-    print(f"loaded {art.name}  Ik={ik:.4f}  ik_head={ik_head}  "
+    e = meta["extra"]; rel_cap = float(e.get("rel_cap", 20.0))
+    base_amp = bool(e.get("base_amp", False))
+    print(f"loaded {art.name}  base_amp={base_amp}  "
           f"shape CV R2={e.get('cv_shape_r2_mean'):.4f}")
 
     print(f"  evaluating against {eval_source} observations")
@@ -90,24 +90,29 @@ def main() -> int:
     df = add_mld(df)
     df = add_relative_target(df, "Chla", rel_cap=rel_cap)
     df = df[np.isfinite(df["mld"]) & np.isfinite(df["NO3"])].reset_index(drop=True)
-    fixed_ze = e.get("gate_fixed_ze")
-    if fixed_ze:
-        df["kd"] = np.full(len(df), np.log(100.0) / float(fixed_ze))
-        print(f"  fixed Ze={float(fixed_ze):.0f} m -> Kd={np.log(100.0)/float(fixed_ze):.4f} /m")
-    else:
-        df["kd"] = kd_from_surface_chl(df["Chla_surf"].to_numpy())
 
     X = build_features(df, include_mld=True, include_no3=True).to_numpy()
     Xn = norm.transform_x(X).astype(np.float32)
-    rl = np.exp(-df["kd"].to_numpy() * df["depth"].to_numpy())
     with torch.no_grad():
-        out = model(torch.from_numpy(Xn).to(device))
+        out = model(torch.from_numpy(Xn).to(device)).cpu().numpy()
+    if base_amp:                                       # base x amplification
+        from bio_params.base_profile import BaseProfile
+        a_max = float(e.get("a_max", 5.0))
+        bp = BaseProfile.from_dict(e["base_profile"])
+        base_col = bp.eval(df["Chla_surf"].to_numpy(), df["depth"].to_numpy())
+        a = a_max * (1.0 / (1.0 + np.exp(-out.ravel())))
+        rel = np.clip(base_col * a, 0.0, rel_cap)
+    else:                                              # light-gated
+        ik = float(e["gate_ik"]); ik_head = bool(e.get("ik_head", False))
+        ik_ref = float(e.get("gate_ik_ref", 0.02)); fixed_ze = e.get("gate_fixed_ze")
+        kd = (np.full(len(df), np.log(100.0) / float(fixed_ze)) if fixed_ze
+              else kd_from_surface_chl(df["Chla_surf"].to_numpy()))
+        rl = np.exp(-kd * df["depth"].to_numpy())
         if ik_head:
-            g = F.softplus(out[:, 0]).cpu().numpy()
-            ik_local = ik_ref * np.exp(np.clip(out[:, 1].cpu().numpy(), -5.0, 5.0))
+            g = np.logaddexp(0.0, out[:, 0]); ik_local = ik_ref * np.exp(np.clip(out[:, 1], -5, 5))
         else:
-            g = F.softplus(out.squeeze(-1)).cpu().numpy(); ik_local = ik
-    rel = np.clip(g * np.tanh(rl / ik_local), 0.0, rel_cap)
+            g = np.logaddexp(0.0, out.ravel()); ik_local = ik
+        rel = np.clip(g * np.tanh(rl / ik_local), 0.0, rel_cap)
     pred = rel * df["Chla_surf"].to_numpy()            # absolute, in-situ surface
     obs = df["Chla"].to_numpy()
     lat = df["latitude"].to_numpy()
@@ -148,7 +153,7 @@ def main() -> int:
                     f"{args.source}_{args.tag} vs {eval_source} obs ({lbl}, {axt})\n"
                     f"n={mask.sum():,}  log-R2(Chl>={PROD_THR})={r2:.3f}  "
                     f"RMSE={rmse:.3g} mg/m3", log_axes=log_axes, lin_max=lin_max)
-        fig.suptitle(f"Gated relative Chl-a ({args.source}_{args.tag}): "
+        fig.suptitle(f"Relative Chl-a ({args.source}_{args.tag}): "
                      f"model (rel x in-situ surface) vs {eval_source} observation",
                      fontsize=12)
         fig.tight_layout()

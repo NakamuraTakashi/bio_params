@@ -41,6 +41,32 @@ def kd_from_surface_chl(chl) -> np.ndarray:
     return np.log(100.0) / morel_euphotic_depth(chl)
 
 
+def daily_insolation_factor(latitude, day_of_year) -> np.ndarray:
+    """Normalized clear-sky (top-of-atmosphere) daily-mean surface light E0.
+
+    Astronomical daily-mean insolation at the top of the atmosphere as a
+    function of latitude and day-of-year, scaled so the equator at equinox = 1.
+    Used to replace the constant surface value (1) in the Beer-Lambert relative
+    light, so the gate's surface light carries the latitude x season cycle:
+    E0 ~ 0 in polar night, ~1 in the tropics, up to ~1.4 at the high-latitude
+    summer solstice (long days). Clouds and atmospheric attenuation are ignored
+    (clear-sky / extraterrestrial limit).
+
+    decl  = 23.45 deg * sin(360 (284 + N)/365)        (Cooper 1969)
+    ws    = arccos(-tan(lat) tan(decl))               (sunset hour angle, clamped
+                                                        for polar day/night)
+    E0    = ws sin(lat) sin(decl) + cos(lat) cos(decl) sin(ws)
+    (= 1 at lat=0, decl=0 since ws=pi/2; eccentricity ~3% is neglected.)
+    """
+    lat = np.deg2rad(np.asarray(latitude, dtype=np.float64))
+    n = np.asarray(day_of_year, dtype=np.float64)
+    decl = np.deg2rad(23.45) * np.sin(2.0 * np.pi * (284.0 + n) / 365.0)
+    cos_ws = np.clip(-np.tan(lat) * np.tan(decl), -1.0, 1.0)
+    ws = np.arccos(cos_ws)
+    e0 = ws * np.sin(lat) * np.sin(decl) + np.cos(lat) * np.cos(decl) * np.sin(ws)
+    return np.maximum(e0, 0.0)
+
+
 def sigma0(salinity, temperature, depth, latitude) -> np.ndarray:
     """Potential density anomaly sigma_0 (kg/m3) via TEOS-10 (gsw)."""
     import gsw

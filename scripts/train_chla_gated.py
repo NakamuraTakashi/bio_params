@@ -38,7 +38,8 @@ from bio_params.loaders.bgc_argo import attach_surface_chla
 from bio_params.loaders.chla_no3 import load_chla_no3
 from bio_params.model import MLP, MLPConfig
 from bio_params.persist import save_artifact
-from bio_params.profiles import add_mld, add_relative_target, kd_from_surface_chl
+from bio_params.profiles import (add_mld, add_relative_target,
+                                  daily_insolation_factor, kd_from_surface_chl)
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CSV = ROOT / "data" / "glodap" / "raw" / "GLODAPv2.2023_Merged_Master_File.csv"
@@ -71,6 +72,10 @@ def parse_args():
     p.add_argument("--fixed-ze", type=float, default=None,
                    help="TEST: fix euphotic depth Ze (m) constant (Kd=ln(100)/Ze) "
                         "instead of Morel(surface Chl); opens the gate deeper")
+    p.add_argument("--seasonal-light", action="store_true",
+                   help="scale the surface light by the latitude/day-of-year "
+                        "clear-sky daily insolation E0 (equator-equinox=1) "
+                        "instead of a constant 1: rel_light = E0*exp(-Kd*z)")
     p.add_argument("--tag", default=None)
     return p.parse_args()
 
@@ -199,6 +204,12 @@ def main() -> int:
     fnames = feature_names(include_mld=True, include_no3=True)
     X = build_features(df, include_mld=True, include_no3=True).to_numpy()
     rl = np.exp(-df["kd"].to_numpy() * df["depth"].to_numpy())   # gate
+    if args.seasonal_light:
+        doy = pd.to_datetime(df["time"]).dt.dayofyear.to_numpy()
+        e0 = daily_insolation_factor(df["latitude"].to_numpy(), doy)
+        rl = e0 * rl
+        print(f"  seasonal surface light E0 ON (equator-equinox=1): "
+              f"median {np.median(e0):.3f}, range {e0.min():.3f}-{e0.max():.3f}")
     y = df["Chla_rel"].to_numpy()
     chla_abs = df["Chla"].to_numpy(); sat_surf = df["surface_chla"].to_numpy()
     lat = df["latitude"].to_numpy(); lon = df["longitude"].to_numpy()
@@ -238,6 +249,7 @@ def main() -> int:
         target="Chla", source=args.source, output_gate=True, relative_target=True,
         include_mld=True, include_no3=True, feature_names=fnames, rel_cap=args.rel_cap,
         gate="tanh(rel_light/Ik)", ik_head=args.ik_head, ik_mean=float(iks.mean()),
+        seasonal_light=args.seasonal_light, gate_fixed_ze=args.fixed_ze,
         shape_r2_mean=float(sr2.mean()), shape_r2_median=float(np.median(sr2)),
         abs_r2_mean=float(ar2.mean()), folds=folds), indent=2))
     print(f"Saved CV -> {metrics_dir / f'cv_Chla_gated{suffix}.json'}")
@@ -260,6 +272,7 @@ def main() -> int:
                              gate="tanh(rel_light/Ik)", gate_ik=float(ik_final),
                              ik_head=args.ik_head, gate_ik_ref=IK_REF,
                              gate_fixed_ze=args.fixed_ze,
+                             seasonal_light=args.seasonal_light,
                              include_mld=True, include_no3=True, rel_cap=args.rel_cap,
                              log_target=False, include_season=False,
                              cv_shape_r2_mean=float(sr2.mean()), cv_abs_r2_mean=float(ar2.mean()),

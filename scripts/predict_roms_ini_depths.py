@@ -36,7 +36,7 @@ import torch
 
 from bio_params.features import build_features
 from bio_params.persist import load_artifact
-from bio_params.profiles import sigma0
+from bio_params.profiles import daily_insolation_factor, sigma0
 
 INI = Path("/mnt/d/COAWST_DATA/FORP_Kuroshio/Ini/Kuro_Ini_FORP_Nz30_20060102.00.nc")
 GRID = Path("/mnt/d/COAWST_DATA/FORP_Kuroshio/Grid/forp-kuroshio_grd_v0.0.nc")
@@ -148,6 +148,15 @@ def _ini_month(path: Path) -> str:
     if not m:
         raise ValueError(f"cannot parse a date from {path.name}")
     return f"{m.group(1)}-{m.group(2)}"
+
+
+def _ini_doy(path: Path) -> int:
+    """Day-of-year from an ini filename like ..._20060102.00.nc (for E0)."""
+    import re
+    m = re.search(r"(\d{4})(\d{2})(\d{2})", path.name)
+    if not m:
+        raise ValueError(f"cannot parse a date from {path.name}")
+    return int(pd.Timestamp(f"{m.group(1)}-{m.group(2)}-{m.group(3)}").dayofyear)
 
 
 def _nearest_index(coord, axis):
@@ -398,6 +407,7 @@ def main() -> int:
         gate_ik = float(extra.get("gate_ik", 0.005))
         ik_head = bool(extra.get("ik_head", False))
         gate_ik_ref = float(extra.get("gate_ik_ref", 0.02))
+        seasonal_light = bool(extra.get("seasonal_light", False))
         rel_cap = float(extra.get("rel_cap", 20.0))
         # Relative models multiply by the satellite surface field for amplitude.
         need_sat = surface_chla or relative_target
@@ -459,6 +469,8 @@ def main() -> int:
                 g = np.logaddexp(0.0, out); ik = gate_ik
             kd = np.log(100.0) / morel_euphotic_depth(sat_field["data"][jj, ii])
             rl = np.exp(-kd * pd_["feat_df"]["depth"].to_numpy())
+            if seasonal_light:
+                rl = daily_insolation_factor(lat[jj, ii], _ini_doy(INI)) * rl
             return np.clip(g * np.tanh(rl / ik), 0.0, rel_cap)
 
         # For relative models, re-anchor the predicted profile to its own
