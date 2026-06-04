@@ -56,6 +56,28 @@ def parse_args():
     p.add_argument("--per-source-profiles", type=int, default=None)
     p.add_argument("--rel-cap", type=float, default=20.0)
     p.add_argument("--a-max", type=float, default=5.0, help="upper bound on the amplification a")
+    p.add_argument("--surface-chla", action="store_true",
+                   help="add log surface Chl-a as a feature (continuous trophic "
+                        "state, beyond the discrete base bin). Uses the DAILY "
+                        "satellite matchup (consistent with ROMS --satellite daily); "
+                        "profiles without a daily match are dropped.")
+    p.add_argument("--matchup", type=Path,
+                   default=ROOT / "data" / "bgc_argo" / "processed" / "satchl_matchup_daily_combined.parquet",
+                   help="daily satellite surface-Chl matchup parquet (--surface-chla / --bin-satellite)")
+    p.add_argument("--bin-satellite", action="store_true",
+                   help="bin the base profile by the DAILY satellite surf (matched), "
+                        "matching ROMS inference; needs a base table built the same way.")
+    p.add_argument("--base-json", type=Path, default=None,
+                   help="base-profile table JSON (default: chla_base_profile.json)")
+    p.add_argument("--strat-features", action="store_true",
+                   help="add pycnocline depth (log z_pyc) + stratification strength "
+                        "(max dsigma/dz) as features (from T/S column)")
+    p.add_argument("--nutricline-features", action="store_true",
+                   help="add nutricline depth (log z_nutr) + sharpness (max dNO3/dz) "
+                        "as features (from the NO3 column)")
+    p.add_argument("--struct-filter-only", action="store_true",
+                   help="compute+filter on structure descriptors (all finite) but add "
+                        "no features (baseline on the same rows for a fair ablation)")
     p.add_argument("--folds", type=int, default=5)
     p.add_argument("--block-deg", type=float, default=5.0)
     p.add_argument("--epochs", type=int, default=200)
@@ -129,16 +151,25 @@ def main() -> int:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     suffix = f"_{args.tag}" if args.tag else ""
     print(f"=== base x amplification Chla  source={args.source}{suffix} ===")
-    if not BASE_JSON.exists():
-        print(f"ERROR: base table missing ({BASE_JSON}); run build_chla_base_profile.py")
+    base_json = args.base_json or BASE_JSON
+    if not base_json.exists():
+        print(f"ERROR: base table missing ({base_json}); run build_chla_base_profile.py")
         return 1
-    base = BaseProfile.from_dict(json.loads(BASE_JSON.read_text()))
+    base = BaseProfile.from_dict(json.loads(base_json.read_text()))
 
     df = load_chla_no3(args.source, glodap_csv=args.csv, sprof_dir=args.sprof_dir)
     print(f"  loaded {len(df):,} co-located rows")
     df = add_mld(df)
     df = add_relative_target(df, "Chla", rel_cap=args.rel_cap)
     df = df[np.isfinite(df["mld"]) & np.isfinite(df["NO3"])].reset_index(drop=True)
+
+    if args.surface_chla or args.bin_satellite:
+        from bio_params.loaders.bgc_argo import attach_surface_chla
+        n0 = len(df)
+        df = attach_surface_chla(df, args.matchup)
+        df = df[np.isfinite(df["surface_chla"])].reset_index(drop=True)
+        print(f"  daily satellite surface Chl attached: {len(df):,}/{n0:,} rows matched"
+              + ("  [bin key]" if args.bin_satellite else ""))
 
     if args.per_source_profiles and "source" in df.columns:
         keys = ["latitude", "longitude", "time"]; rng = np.random.default_rng(args.seed)
@@ -152,9 +183,26 @@ def main() -> int:
         ng = int((df.source == "glodap").sum()); na = int((df.source == "bgc_argo").sum())
         print(f"  balanced <= {args.per_source_profiles} profiles/source: {len(df):,} rows (glodap={ng:,}, bgc={na:,})")
 
-    fnames = feature_names(include_mld=True, include_no3=True)
-    X = build_features(df, include_mld=True, include_no3=True).to_numpy()
-    base_col = base.eval(df["Chla_surf"].to_numpy(), df["depth"].to_numpy())  # in-situ surf
+    if args.strat_features or args.nutricline_features or args.struct_filter_only:
+        from bio_params.profiles import add_structure_descriptors
+        n0 = len(df); df = add_structure_descriptors(df)
+        # filter on ALL descriptors (same rows across the ablation configs)
+        need = ["z_pyc", "strat_max", "z_nutr", "nutr_max"]
+        df = df[np.all([np.isfinite(df[c].to_numpy()) for c in need], axis=0)].reset_index(drop=True)
+        print(f"  structure descriptors (all finite): {len(df):,}/{n0:,} rows")
+
+    fnames = feature_names(include_mld=True, include_no3=True,
+                           include_surface_chla=args.surface_chla, surface_chla_log=True)
+    X = build_features(df, include_mld=True, include_no3=True,
+                       include_surface_chla=args.surface_chla, surface_chla_log=True).to_numpy()
+    if args.strat_features:
+        X = np.column_stack([X, np.log(df["z_pyc"].to_numpy() + 1.0), df["strat_max"].to_numpy()])
+        fnames = fnames + ["log_z_pyc", "strat_max"]
+    if args.nutricline_features:
+        X = np.column_stack([X, np.log(df["z_nutr"].to_numpy() + 1.0), df["nutr_max"].to_numpy()])
+        fnames = fnames + ["log_z_nutr", "nutr_max"]
+    bin_surf = (df["surface_chla"] if args.bin_satellite else df["Chla_surf"]).to_numpy()
+    base_col = base.eval(bin_surf, df["depth"].to_numpy())   # satellite bin if --bin-satellite
     y = df["Chla_rel"].to_numpy()
     surf_insitu = df["Chla_surf"].to_numpy()
     lat = df["latitude"].to_numpy(); lon = df["longitude"].to_numpy()
@@ -186,8 +234,9 @@ def main() -> int:
     metrics_dir.mkdir(parents=True, exist_ok=True)
     (metrics_dir / f"cv_Chla_baseamp{suffix}.json").write_text(json.dumps(dict(
         target="Chla", source=args.source, base_amp=True, relative_target=True,
-        a_max=args.a_max, include_mld=True, include_no3=True, feature_names=fnames,
-        rel_cap=args.rel_cap, shape_r2_mean=float(sr2.mean()),
+        a_max=args.a_max, include_mld=True, include_no3=True,
+        surface_chla=args.surface_chla, surface_chla_log=True, bin_satellite=args.bin_satellite,
+        feature_names=fnames, rel_cap=args.rel_cap, shape_r2_mean=float(sr2.mean()),
         shape_r2_median=float(np.median(sr2)), abs_r2_mean=float(ar2.mean()), folds=folds), indent=2))
     print(f"Saved CV -> {metrics_dir / f'cv_Chla_baseamp{suffix}.json'}")
     if args.no_final:
@@ -205,7 +254,9 @@ def main() -> int:
     save_artifact(art, model=model, normalizer=norm, feature_names=fnames, target_name="Chla_rel",
                   extra=dict(source=args.source, base_amp=True, relative_target=True,
                              a_max=args.a_max, base_profile=base.to_dict(),
-                             include_mld=True, include_no3=True, rel_cap=args.rel_cap,
+                             include_mld=True, include_no3=True,
+                             surface_chla=args.surface_chla, surface_chla_log=True,
+                             bin_satellite=args.bin_satellite, rel_cap=args.rel_cap,
                              log_target=False, include_season=False,
                              cv_shape_r2_mean=float(sr2.mean()), cv_abs_r2_mean=float(ar2.mean()),
                              n_rows=int(len(X)), epochs_run_final=eps))

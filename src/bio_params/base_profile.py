@@ -32,25 +32,44 @@ MIN_COUNT = 20  # minimum rows in a (surf-bin, depth-node) cell to trust the med
 
 @dataclass
 class BaseProfile:
-    surf_edges: np.ndarray   # (nb+1,)
-    depth_grid: np.ndarray   # (nd,)
-    table: np.ndarray        # (nb, nd) median rel; row 0 (surface) forced to 1
-    counts: np.ndarray       # (nb, nd) sample counts
+    surf_edges: np.ndarray            # (nb+1,) bin boundaries used to build the table
+    depth_grid: np.ndarray            # (nd,)
+    table: np.ndarray                 # (nb, nd) median rel; row 0 (surface) forced to 1
+    counts: np.ndarray                # (nb, nd) sample counts
+    surf_centers: np.ndarray | None = None  # (nb,) log10 surf at each bin; enables
+    #                                         continuous (smooth) interpolation over
+    #                                         surface Chl instead of nearest-bin
 
     def to_dict(self) -> dict:
-        return dict(surf_edges=self.surf_edges.tolist(),
-                    depth_grid=self.depth_grid.tolist(),
-                    table=self.table.tolist(), counts=self.counts.tolist())
+        d = dict(surf_edges=self.surf_edges.tolist(), depth_grid=self.depth_grid.tolist(),
+                 table=self.table.tolist(), counts=self.counts.tolist())
+        if self.surf_centers is not None:
+            d["surf_centers"] = self.surf_centers.tolist()
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "BaseProfile":
+        sc = d.get("surf_centers")
         return cls(np.asarray(d["surf_edges"], float), np.asarray(d["depth_grid"], float),
-                   np.asarray(d["table"], float), np.asarray(d["counts"], float))
+                   np.asarray(d["table"], float), np.asarray(d["counts"], float),
+                   None if sc is None else np.asarray(sc, float))
 
     def eval(self, surf_chl, depth) -> np.ndarray:
-        """rel_base at each (surface Chl, depth) row: nearest surf bin, linear in
-        depth; 1 at the surface, 0 below the deepest grid node (hard deep->0)."""
+        """rel_base at each (surface Chl, depth). With `surf_centers` set, the base
+        is interpolated SMOOTHLY over log10(surface Chl) and depth (no bin jumps);
+        otherwise the nearest surf bin is used. 1 at the surface, 0 below the
+        deepest grid node (hard deep->0) in both modes."""
         surf_chl = np.asarray(surf_chl, float); depth = np.asarray(depth, float)
+        if self.surf_centers is not None:
+            from scipy.interpolate import RegularGridInterpolator
+            c = self.surf_centers
+            interp = RegularGridInterpolator((c, self.depth_grid), self.table,
+                                             bounds_error=False, fill_value=None)
+            ls = np.clip(np.log10(np.clip(surf_chl, 1e-3, None)), c[0], c[-1])
+            z = np.clip(depth, self.depth_grid[0], self.depth_grid[-1])
+            out = interp(np.column_stack([ls, z]))
+            out = np.where(depth > self.depth_grid[-1], 0.0, out)
+            return np.clip(out, 0.0, None)
         nb = len(self.surf_edges) - 1
         sb = np.clip(np.digitize(surf_chl, self.surf_edges) - 1, 0, nb - 1)
         out = np.empty(len(depth), float)
@@ -63,10 +82,22 @@ class BaseProfile:
 
 
 def build_base_profile(surf_chl, depth, rel, *, surf_edges=DEFAULT_SURF_EDGES,
-                       depth_grid=DEFAULT_DEPTH_GRID, min_count=MIN_COUNT) -> BaseProfile:
-    """Median rel per (surface-Chl bin, nearest depth node), gap-filled in depth."""
+                       depth_grid=DEFAULT_DEPTH_GRID, min_count=MIN_COUNT,
+                       quantile=False, n_bins=9, continuous=False) -> BaseProfile:
+    """Median rel per (surface-Chl bin, nearest depth node), gap-filled in depth.
+
+    `quantile=True` replaces the fixed surf_edges with equal-count (quantile)
+    bins of the surface Chl (stable medians, finer where data is dense).
+    `continuous=True` also stores per-bin log10 surf centers so BaseProfile.eval
+    interpolates SMOOTHLY over surface Chl (no bin jumps).
+    """
     surf_chl = np.asarray(surf_chl, float); depth = np.asarray(depth, float)
     rel = np.asarray(rel, float)
+    if quantile:
+        s = surf_chl[np.isfinite(surf_chl) & (surf_chl > 0)]
+        edges = np.unique(np.quantile(s, np.linspace(0.0, 1.0, n_bins + 1)))
+        edges[0] = 0.0; edges[-1] = max(float(edges[-1]) * 10, 1e3)  # cover tails
+        surf_edges = edges
     nb = len(surf_edges) - 1; nd = len(depth_grid)
     sb = np.clip(np.digitize(surf_chl, surf_edges) - 1, 0, nb - 1)
     mids = (depth_grid[:-1] + depth_grid[1:]) / 2.0
@@ -87,5 +118,19 @@ def build_base_profile(surf_chl, depth, rel, *, surf_edges=DEFAULT_SURF_EDGES,
         else:
             table[b] = np.exp(-depth_grid / 50.0)  # fallback typical decay
         table[b, 0] = 1.0
+    surf_centers = None
+    if continuous:
+        centers = np.full(nb, np.nan)
+        for b in range(nb):
+            s = surf_chl[(sb == b) & np.isfinite(surf_chl) & (surf_chl > 0)]
+            if s.size:
+                centers[b] = float(np.median(np.log10(s)))
+        for b in range(nb):                                   # fill empty bins
+            if not np.isfinite(centers[b]):
+                lo = max(surf_edges[b], 1e-3); hi = min(surf_edges[b + 1], 1e3)
+                centers[b] = 0.5 * (np.log10(lo) + np.log10(hi))
+        for b in range(1, nb):                                # strictly increasing
+            centers[b] = max(centers[b], centers[b - 1] + 1e-3)
+        surf_centers = centers
     return BaseProfile(np.asarray(surf_edges, float), np.asarray(depth_grid, float),
-                       table, counts)
+                       table, counts, surf_centers)

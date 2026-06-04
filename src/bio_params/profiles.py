@@ -114,6 +114,61 @@ def add_mld(
     return out.drop(columns="_sig0")
 
 
+def add_structure_descriptors(
+    df: pd.DataFrame,
+    *,
+    keys=DEFAULT_KEYS,
+    dmin: float = 5.0,
+    dmax: float = 300.0,
+    min_levels: int = 4,
+) -> pd.DataFrame:
+    """Add per-profile vertical-structure descriptors from the sigma_t and NO3
+    columns (broadcast to every level row):
+
+      z_pyc     : depth (m) of the maximum density gradient d(sigma_t)/dz  (pycnocline)
+      strat_max : that maximum gradient (kg/m3/m)                          (stratification)
+      z_nutr    : depth (m) of the maximum d(NO3)/dz                        (nutricline)
+      nutr_max  : that maximum gradient (umol/kg/m)                        (nutricline sharpness)
+
+    The DCM sits near the pycnocline/nutricline, so these "where/how sharp is the
+    structure" summaries carry column information the point-wise T/S/NO3 do not.
+    Gradients are searched in [dmin, dmax] m; profiles with < min_levels there get
+    NaN (caller drops them). sigma_t is the potential density anomaly (gsw).
+    NO3 descriptors are added only if an `NO3` column is present.
+    """
+    keys = list(keys)
+    out = df.copy()
+    out["_sig"] = sigma0(out["salinity"].to_numpy(), out["temperature"].to_numpy(),
+                         out["depth"].to_numpy(), out["latitude"].to_numpy())
+    has_no3 = "NO3" in out.columns
+
+    def _grad_peak(d, v):
+        ok = np.isfinite(d) & np.isfinite(v)
+        d, v = d[ok], v[ok]
+        sel = (d >= dmin) & (d <= dmax)
+        if sel.sum() < min_levels:
+            return np.nan, np.nan
+        d, v = d[sel], v[sel]
+        dz = np.diff(d); good = dz > 0
+        if not good.any():
+            return np.nan, np.nan
+        grad = np.diff(v)[good] / dz[good]
+        mid = ((d[:-1] + d[1:]) / 2.0)[good]
+        i = int(np.argmax(grad))
+        return float(mid[i]), float(max(grad[i], 0.0))
+
+    def _desc(g: pd.DataFrame) -> pd.Series:
+        g = g.sort_values("depth")
+        d = g["depth"].to_numpy()
+        zp, sm = _grad_peak(d, g["_sig"].to_numpy())
+        zn, nm = (_grad_peak(d, g["NO3"].to_numpy()) if has_no3 else (np.nan, np.nan))
+        return pd.Series(dict(z_pyc=zp, strat_max=sm, z_nutr=zn, nutr_max=nm))
+
+    desc = out.groupby(keys, sort=False).apply(_desc, include_groups=False)
+    out = out.drop(columns="_sig").merge(desc, left_on=keys, right_index=True, how="left")
+    return out
+
+
 def add_relative_target(
     df: pd.DataFrame,
     target: str,

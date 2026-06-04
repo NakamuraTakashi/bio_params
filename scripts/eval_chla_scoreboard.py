@@ -25,6 +25,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 
@@ -38,17 +39,28 @@ from bio_params.profiles import (add_mld, add_relative_target,
 ROOT = Path(__file__).resolve().parent.parent
 MODEL_DIR = ROOT / "models" / "pretrained"
 DEFAULT_CSV = ROOT / "data" / "glodap" / "raw" / "GLODAPv2.2023_Merged_Master_File.csv"
-DEPTH_BANDS = [(0, 10), (10, 30), (30, 75), (75, 150), (150, 500)]
+DAILY_MATCHUP = ROOT / "data" / "bgc_argo" / "processed" / "satchl_matchup_daily_combined.parquet"
+DEPTH_BANDS = [(0, 10), (10, 30), (30, 75), (75, 150), (150, 300), (300, 600)]
 
 
-def _rel_pred(art_path, df, X, device):
+def _rel_pred(art_path, df, device):
     """Reconstruct rel(z) for one model (gated or base x amplification),
-    honoring its extra flags. Returns (rel, config_string)."""
+    honoring its extra flags (features built per the model). Returns
+    (rel, config_string)."""
     model, norm, meta = load_artifact(art_path, map_location=device)
     model.to(device).eval()
     e = meta["extra"]
     rel_cap = float(e.get("rel_cap", 20.0))
     surf = df["Chla_surf"].to_numpy()
+    sfc = bool(e.get("surface_chla", False))
+    if sfc:
+        # surface-Chl models are trained on the daily satellite matchup, so feed
+        # the same here (rows without a daily match -> NaN -> excluded).
+        df = df.assign(surface_chla=df["_sat_daily"].to_numpy())
+    X = build_features(df, include_mld=bool(e.get("include_mld", True)),
+                       include_no3=bool(e.get("include_no3", True)),
+                       include_surface_chla=sfc,
+                       surface_chla_log=bool(e.get("surface_chla_log", True))).to_numpy()
     Xn = norm.transform_x(X)
     with torch.no_grad():
         out = model(torch.as_tensor(Xn, dtype=torch.float32, device=device)).cpu().numpy()
@@ -56,10 +68,13 @@ def _rel_pred(art_path, df, X, device):
     if e.get("base_amp"):
         a_max = float(e.get("a_max", 5.0))
         base = BaseProfile.from_dict(e["base_profile"])
-        base_col = base.eval(surf, df["depth"].to_numpy())
+        # bin by the daily satellite surf if the model was built that way (matches
+        # ROMS inference), else by in-situ surface.
+        bin_surf = df["_sat_daily"].to_numpy() if e.get("bin_satellite") else surf
+        base_col = base.eval(bin_surf, df["depth"].to_numpy())
         a = a_max * (1.0 / (1.0 + np.exp(-out.ravel())))
         rel = np.clip(base_col * a, 0.0, rel_cap)
-        return rel, f"base_amp A_max={a_max}"
+        return rel, f"base_amp A_max={a_max}" + (" sat-bin" if e.get("bin_satellite") else "")
 
     # light-gated model
     ik_head = bool(e.get("ik_head", False))
@@ -99,6 +114,9 @@ def main() -> int:
                    help="full model stems -> models/pretrained/<stem>.pt "
                         "(e.g. combined_Chla_baseamp_uitz); auto-detects base_amp vs gated")
     p.add_argument("--rel-cap", type=float, default=20.0)
+    p.add_argument("--matched-only", action="store_true",
+                   help="restrict eval to rows with a daily satellite match "
+                        "(same rows for all models = apples-to-apples)")
     args = p.parse_args()
     entries = [(t, MODEL_DIR / f"combined_Chla_gated_{t}.pt") for t in args.tags]
     entries += [(m, MODEL_DIR / f"{m}.pt") for m in args.models]
@@ -112,22 +130,29 @@ def main() -> int:
     df = df[np.isfinite(df["mld"]) & np.isfinite(df["NO3"])
             & np.isfinite(df["Chla"])].reset_index(drop=True)
     df["_doy"] = df["time"].dt.dayofyear
-    X = build_features(df, include_mld=True, include_no3=True).to_numpy()
+    # daily satellite surface Chl for surface-Chl models (matched feature, fair eval)
+    mday = pd.read_parquet(DAILY_MATCHUP)[["latitude", "longitude", "time", "surface_chla"]]
+    mday["time"] = pd.to_datetime(mday["time"])
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.merge(mday.rename(columns={"surface_chla": "_sat_daily"}),
+                  on=["latitude", "longitude", "time"], how="left")
+    if args.matched_only:
+        df = df[np.isfinite(df["_sat_daily"])].reset_index(drop=True)
     obs = df["Chla"].to_numpy(); surf = df["Chla_surf"].to_numpy()
     depth = df["depth"].to_numpy()
-    print(f"GLODAP co-located eval rows: {len(df):,}  "
-          f"(obs>=1: {int((obs>=1).sum()):,})")
+    print(f"GLODAP co-located eval rows: {len(df):,}  (obs>=1: {int((obs>=1).sum()):,})  "
+          f"| daily-satellite matched: {int(np.isfinite(df['_sat_daily']).sum()):,}")
 
     for name, art in entries:
         if not art.exists():
             print(f"\n[{name}] MISSING {art.name}"); continue
-        rel, cfg = _rel_pred(art, df, X, device)
+        rel, cfg = _rel_pred(art, df, device)
         pred = rel * surf
         tag = name
         rmse, bias, n = _log_metrics(obs, pred)
         print(f"\n=== [{tag}]  {cfg} ===")
         print(f"  global: log10-RMSE {rmse:.3f}  bias(med pred/obs) {bias:.2f}  (n>=0.02 = {n:,})")
-        hi = obs >= 1
+        hi = (obs >= 1) & np.isfinite(pred)   # score only where the model produced a value
         und = hi & (pred <= 0.1)
         print(f"  UNDER (obs>=1 & pred<=0.1): {int(und.sum()):,}/{int(hi.sum()):,} "
               f"= {100*und.sum()/max(hi.sum(),1):.1f}%")

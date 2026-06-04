@@ -45,13 +45,13 @@ def surface_insitu(df: pd.DataFrame) -> pd.DataFrame:
     return surf.rename(columns={"Chla": "insitu", "depth": "surf_depth"})
 
 
-def load_source(source: str) -> pd.DataFrame:
+def load_source(source: str, matchup_path=None) -> pd.DataFrame:
     if source == "bgc_argo":
         df = load_bgc_argo(SPROF, "Chla")
-        matchup = PROC / "satchl_matchup.parquet"
+        matchup = matchup_path or (PROC / "satchl_matchup.parquet")
     else:
         df = load_glodap(CSV, "Chla", with_time=True)
-        matchup = PROC / "satchl_matchup_glodap.parquet"
+        matchup = matchup_path or (PROC / "satchl_matchup_glodap.parquet")
     surf = surface_insitu(df)
     m = pd.read_parquet(matchup)
     m["time"] = pd.to_datetime(m["time"])
@@ -105,22 +105,28 @@ def scatter(ax, sat, ins, title, log_axes=True):
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--sources", nargs="+", default=["bgc_argo", "glodap"])
+    p.add_argument("--matchup", type=Path, default=None,
+                   help="use this single matchup parquet for all sources "
+                        "(e.g. the daily combined matchup) instead of the per-source "
+                        "monthly defaults")
+    p.add_argument("--tag", default=None, help="filename suffix (e.g. daily)")
     args = p.parse_args()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    sfx = f"_{args.tag}" if args.tag else ""
 
     # Load each source once (loading is the expensive part), then draw both
     # log-axis and linear-axis versions.
     data = {}
     for src in args.sources:
-        j = load_source(src)
+        j = load_source(src, matchup_path=args.matchup)
         s = stats(j["satellite"].to_numpy(), j["insitu"].to_numpy())
         data[src] = (j, s)
         print(f"{src}: n={s['n']:,}  log-R2={s['r2_log']:.3f}  "
               f"RMSE(log10)={s['rmse_log']:.3f}  slope={s['slope']:.3f}  "
               f"median(insitu/sat)={s['med_ratio']:.2f}")
 
-    for log_axes, fname in [(True, "satellite_vs_insitu_surface.png"),
-                            (False, "satellite_vs_insitu_surface_linear.png")]:
+    for log_axes, fname in [(True, f"satellite_vs_insitu_surface{sfx}.png"),
+                            (False, f"satellite_vs_insitu_surface{sfx}_linear.png")]:
         fig, axes = plt.subplots(1, len(args.sources),
                                  figsize=(7 * len(args.sources), 6.5))
         if len(args.sources) == 1:

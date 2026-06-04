@@ -19,6 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 
@@ -41,10 +42,13 @@ def r2_log(obs, pred):
     return 1.0 - ss / tot if tot > 0 else float("nan")
 
 
-def scatter(ax, obs, pred, title, log_axes=True, lin_max=None):
+def scatter(ax, obs, pred, title, log_axes=True, lin_max=None, log_range=None):
     if log_axes:
-        lo = max(1e-3, float(min(obs.min(), pred.min())))
-        hi = float(max(obs.max(), pred.max()))
+        if log_range is not None:
+            lo, hi = float(log_range[0]), float(log_range[1])
+        else:
+            lo = max(1e-3, float(min(obs.min(), pred.min())))
+            hi = float(max(obs.max(), pred.max()))
         extent = (np.log10(lo), np.log10(hi), np.log10(lo), np.log10(hi))
         kw = dict(xscale="log", yscale="log")
     else:
@@ -70,6 +74,9 @@ def main() -> int:
                    help="data source to validate against (default = --source). "
                         "Use 'glodap' for absolute validation (GLODAP surface "
                         "matches satellite; BGC-Argo is biased in absolute terms).")
+    p.add_argument("--log-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                   help="fixed log-log axis range, e.g. --log-range 1e-4 1e2 "
+                        "(overview at max range; saved as ..._logrange.png)")
     p.add_argument("--linear-max", type=float, nargs="+", default=None,
                    help="upper limit(s) for the linear-axis scatter; one figure per "
                         "value, named ..._linear_max<N>.png (e.g. --linear-max 20 10 5)")
@@ -91,7 +98,17 @@ def main() -> int:
     df = add_relative_target(df, "Chla", rel_cap=rel_cap)
     df = df[np.isfinite(df["mld"]) & np.isfinite(df["NO3"])].reset_index(drop=True)
 
-    X = build_features(df, include_mld=True, include_no3=True).to_numpy()
+    sfc = bool(e.get("surface_chla", False))
+    if sfc:
+        # surface-Chl models train on the daily satellite matchup; feed the same.
+        md = ROOT / "data" / "bgc_argo" / "processed" / "satchl_matchup_daily_combined.parquet"
+        m = pd.read_parquet(md)[["latitude", "longitude", "time", "surface_chla"]]
+        m["time"] = pd.to_datetime(m["time"]); df["time"] = pd.to_datetime(df["time"])
+        df = df.merge(m, on=["latitude", "longitude", "time"], how="left")
+        df = df[np.isfinite(df["surface_chla"])].reset_index(drop=True)
+    X = build_features(df, include_mld=True, include_no3=True,
+                       include_surface_chla=sfc,
+                       surface_chla_log=bool(e.get("surface_chla_log", True))).to_numpy()
     Xn = norm.transform_x(X).astype(np.float32)
     with torch.no_grad():
         out = model(torch.from_numpy(Xn).to(device)).cpu().numpy()
@@ -126,7 +143,7 @@ def main() -> int:
     # the log-R2 is reported on the meaningful Chl band (obs >= PROD_THR). RMSE
     # (linear) is over all points.
     PROD_THR = 0.02
-    pred_plot = np.maximum(pred, 1e-3)
+    pred_plot = np.maximum(pred, 1e-5)   # low floor so a wide log range shows the spread
     stats = {}
     for lbl, mask in [("global", keep), ("Japan box", jp)]:
         prod = mask & (obs >= PROD_THR)
@@ -139,20 +156,24 @@ def main() -> int:
     base = f"scatter_{args.source}_{args.tag}{evsfx}"
     # One log-axis figure, then one linear figure per requested upper limit
     # (distinct filename per limit so earlier figures are not overwritten).
-    panels = [(True, None, f"{base}.png")]
+    panels = [(True, None, None, f"{base}.png")]
+    if args.log_range:
+        panels.append((True, None, tuple(args.log_range), f"{base}_logrange.png"))
     for lm in (args.linear_max if args.linear_max else [None]):
         sfx = "_linear" if lm is None else f"_linear_max{int(lm)}"
-        panels.append((False, lm, f"{base}{sfx}.png"))
+        panels.append((False, lm, None, f"{base}{sfx}.png"))
 
-    for log_axes, lin_max, fname in panels:
+    for log_axes, lin_max, lrange, fname in panels:
         fig, axes = plt.subplots(1, 2, figsize=(13, 6.2))
         for ax, lbl in zip(axes, ["global", "Japan box"]):
             mask, r2, rmse = stats[lbl]
-            axt = "log-log" if log_axes else f"linear 0-{int(lin_max)}" if lin_max else "linear"
+            axt = (f"log-log {lrange[0]:g}-{lrange[1]:g}" if lrange else "log-log") \
+                if log_axes else (f"linear 0-{int(lin_max)}" if lin_max else "linear")
             scatter(ax, obs[mask], pred_plot[mask],
                     f"{args.source}_{args.tag} vs {eval_source} obs ({lbl}, {axt})\n"
                     f"n={mask.sum():,}  log-R2(Chl>={PROD_THR})={r2:.3f}  "
-                    f"RMSE={rmse:.3g} mg/m3", log_axes=log_axes, lin_max=lin_max)
+                    f"RMSE={rmse:.3g} mg/m3", log_axes=log_axes, lin_max=lin_max,
+                    log_range=lrange)
         fig.suptitle(f"Relative Chl-a ({args.source}_{args.tag}): "
                      f"model (rel x in-situ surface) vs {eval_source} observation",
                      fontsize=12)
