@@ -99,14 +99,28 @@ def _qc_ok(ds: xr.Dataset, name: str, qc_ok: set[str], shape) -> np.ndarray:
     return np.ones(shape, dtype=bool)
 
 
+# Fluorescence dark-offset (residual dark count) correction for CHLA: estimate a
+# per-float offset from the deep signal (where real Chl ~ 0) and subtract it.
+DARK_DEEP_DBAR = 900.0       # prefer levels deeper than this for the offset
+DARK_FALLBACK_DBAR = 300.0   # if the float is shallow, use > this instead
+DARK_MIN_LEVELS = 5          # need at least this many deep levels to trust it
+
+
 def load_sprof_file(
     path: str | Path,
     target: str,
     *,
     modes: tuple[str, ...] | None = None,
     qc_ok: set[str] | None = None,
+    dark_correct: bool = False,
 ) -> pd.DataFrame:
-    """Load one float's _Sprof.nc into common-schema rows for `target`."""
+    """Load one float's _Sprof.nc into common-schema rows for `target`.
+
+    `dark_correct` (CHLA only): subtract a per-float fluorescence dark offset,
+    estimated as the median CHLA below `DARK_DEEP_DBAR` (or `DARK_FALLBACK_DBAR`
+    for shallow floats), then clip to >= 0. Removes the ~0.007 mg/m3 instrumental
+    floor that does not cancel in the surface-normalized (relative) target.
+    """
     if target not in TARGET_PARAM:
         raise ValueError(f"unknown target {target!r}; available {available_targets()}")
     param = TARGET_PARAM[target]
@@ -124,6 +138,14 @@ def load_sprof_file(
         temp = _level_field(ds, "TEMP_ADJUSTED")
         psal = _level_field(ds, "PSAL_ADJUSTED")
         pres = _level_field(ds, "PRES_ADJUSTED")
+
+        if dark_correct and target == "Chla":
+            fv = np.isfinite(value) & np.isfinite(pres)
+            deep = fv & (pres > DARK_DEEP_DBAR)
+            if int(deep.sum()) < DARK_MIN_LEVELS:
+                deep = fv & (pres > DARK_FALLBACK_DBAR)
+            off = float(np.nanmedian(value[deep])) if int(deep.sum()) >= DARK_MIN_LEVELS else 0.0
+            value = np.clip(value - max(off, 0.0), 0.0, None)
 
         # Per-profile position; some profiles have missing/failed GPS fixes
         # (NaN LATITUDE/LONGITUDE). Exclude those so downstream features are
@@ -227,6 +249,7 @@ def load_bgc_argo(
     modes: tuple[str, ...] | None = None,
     qc_ok: set[str] | None = None,
     valid_range: tuple[float, float] | None = None,
+    dark_correct: bool = False,
 ) -> pd.DataFrame:
     """Load all _Sprof.nc in `sprof_dir` into common-schema rows for `target`.
 
@@ -240,7 +263,8 @@ def load_bgc_argo(
     if not files:
         raise FileNotFoundError(f"no *_Sprof.nc in {sprof_dir}")
 
-    frames = [load_sprof_file(f, target, modes=modes, qc_ok=qc_ok) for f in files]
+    frames = [load_sprof_file(f, target, modes=modes, qc_ok=qc_ok,
+                              dark_correct=dark_correct) for f in files]
     df = pd.concat(frames, ignore_index=True)
     # Concatenating with empty frames can demote `time` to object dtype, which
     # breaks the .dt accessor used downstream (e.g. day-of-year features).

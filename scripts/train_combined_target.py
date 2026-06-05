@@ -56,6 +56,24 @@ def parse_args() -> argparse.Namespace:
                    help="Satellite surface-Chl matchup parquet (covers both sources)")
     p.add_argument("--tag", default=None,
                    help="Suffix for artifact/metrics names, e.g. --tag satchl")
+    p.add_argument("--box", type=float, nargs=4, default=None,
+                   metavar=("LON0", "LON1", "LAT0", "LAT1"),
+                   help="restrict to a region, e.g. --box 120 160 20 50 (Japan)")
+    p.add_argument("--with-no3", action="store_true",
+                   help="add NO3 as a point feature (implies the Chla+NO3 co-located set)")
+    p.add_argument("--no3-data", action="store_true",
+                   help="load the Chla+NO3 co-located set WITHOUT using NO3 as a point "
+                        "feature (keeps the same rows across an NO3 on/off ablation)")
+    p.add_argument("--nutricline-features", action="store_true",
+                   help="add nutricline depth (log z_nutr) + sharpness (max dNO3/dz) "
+                        "features (per-profile; requires the NO3 column)")
+    p.add_argument("--strat-features", action="store_true",
+                   help="add pycnocline depth (log z_pyc) + stratification (max dsigma/dz)")
+    p.add_argument("--mld-feature", action="store_true",
+                   help="add mixed-layer depth (log_mld) as a feature")
+    p.add_argument("--cutoff-depth", type=float, default=None,
+                   help="zero the prediction below this depth (m) at inference/eval "
+                        "(stored in the artifact); e.g. --cutoff-depth 300")
     p.add_argument("--folds", type=int, default=5)
     p.add_argument("--block-deg", type=float, default=5.0)
     p.add_argument("--epochs", type=int, default=200)
@@ -93,8 +111,21 @@ def main() -> int:
 
     suffix = f"_{args.tag}" if args.tag else ""
     print(f"=== combined (GLODAP+BGC-Argo) target={args.target}{suffix}  spatial block CV ===")
-    df = load_combined(args.csv, args.sprof_dir, target=args.target,
-                       per_source_max=args.per_source_max, seed=args.seed)
+    use_no3_loader = args.with_no3 or args.no3_data or args.nutricline_features
+    if use_no3_loader:
+        from bio_params.loaders.chla_no3 import load_chla_no3
+        df = load_chla_no3("combined", glodap_csv=args.csv, sprof_dir=args.sprof_dir,
+                           box=tuple(args.box) if args.box else None)
+        print(f"  Chla+NO3 co-located: {len(df):,} rows "
+              f"(NO3 point feature={args.with_no3})")
+    else:
+        df = load_combined(args.csv, args.sprof_dir, target=args.target,
+                           per_source_max=args.per_source_max, seed=args.seed)
+        if args.box:
+            lon0, lon1, lat0, lat1 = args.box
+            df = df[(df.longitude >= lon0) & (df.longitude <= lon1)
+                    & (df.latitude >= lat0) & (df.latitude <= lat1)].reset_index(drop=True)
+            print(f"  box {args.box}: {len(df):,} rows")
 
     surface_chla = args.surface_chla
     surface_chla_log = not args.surface_chla_linear
@@ -105,15 +136,35 @@ def main() -> int:
         print(f"  {len(df):,} rows with satellite surface Chl-a "
               f"({n_before - len(df):,} dropped: unmatched/masked/out-of-range)")
 
+    if args.mld_feature:
+        from bio_params.profiles import add_mld
+        df = add_mld(df)
+        df = df[np.isfinite(df["mld"])].reset_index(drop=True)
+    if args.nutricline_features or args.strat_features:
+        from bio_params.profiles import add_structure_descriptors
+        n0 = len(df); df = add_structure_descriptors(df)
+        need = (["z_nutr", "nutr_max"] if args.nutricline_features else []) + \
+               (["z_pyc", "strat_max"] if args.strat_features else [])
+        df = df[np.all([np.isfinite(df[c].to_numpy()) for c in need], axis=0)].reset_index(drop=True)
+        print(f"  structure features {need}: {len(df):,}/{n0:,} rows")
+
     ng = int((df.source == "glodap").sum())
     na = int((df.source == "bgc_argo").sum())
     print(f"  rows: {len(df):,}  (glodap={ng:,} {100*ng/len(df):.1f}%, bgc_argo={na:,})")
 
     feats = build_features(df, include_surface_chla=surface_chla,
-                           surface_chla_log=surface_chla_log)
+                           surface_chla_log=surface_chla_log, include_no3=args.with_no3,
+                           include_mld=args.mld_feature)
     fnames = feature_names(include_surface_chla=surface_chla,
-                           surface_chla_log=surface_chla_log)
+                           surface_chla_log=surface_chla_log, include_no3=args.with_no3,
+                           include_mld=args.mld_feature)
     X = feats.to_numpy()
+    if args.nutricline_features:
+        X = np.column_stack([X, np.log(df["z_nutr"].to_numpy() + 1.0), df["nutr_max"].to_numpy()])
+        fnames = fnames + ["log_z_nutr", "nutr_max"]
+    if args.strat_features:
+        X = np.column_stack([X, np.log(df["z_pyc"].to_numpy() + 1.0), df["strat_max"].to_numpy()])
+        fnames = fnames + ["log_z_pyc", "strat_max"]
     y = df[args.target].to_numpy()
     lat = df["latitude"].to_numpy()
     lon = df["longitude"].to_numpy()
@@ -180,6 +231,9 @@ def main() -> int:
                          "n_glodap": ng, "n_bgc_argo": na,
                          "per_source_max": args.per_source_max,
                          "surface_chla": surface_chla, "surface_chla_log": surface_chla_log,
+                         "include_no3": args.with_no3, "cutoff_depth": args.cutoff_depth,
+                         "nutricline_features": args.nutricline_features,
+                         "strat_features": args.strat_features, "include_mld": args.mld_feature,
                          "log_target": False, "include_season": False,
                          "cv_rmse_mean": float(rmses.mean()), "cv_r2_mean": float(r2s.mean()),
                          "cv_r2_std": float(r2s.std()), "cv_block_deg": args.block_deg,

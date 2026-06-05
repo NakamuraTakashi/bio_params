@@ -51,6 +51,11 @@ def main() -> int:
     p.add_argument("--depth-max", type=float, default=300.0,
                    help="extend the base depth grid (and hence the hard 0-cutoff) "
                         "to this depth, with 50 m nodes beyond 300 m")
+    p.add_argument("--dark-correct", action="store_true",
+                   help="subtract the per-float BGC-Argo fluorescence dark offset")
+    p.add_argument("--box", type=float, nargs=4, default=None,
+                   metavar=("LON0", "LON1", "LAT0", "LAT1"),
+                   help="restrict to a region, e.g. --box 120 160 20 50 (Japan)")
     args = p.parse_args()
     if args.depth_max > DEFAULT_DEPTH_GRID[-1]:
         extra = np.arange(DEFAULT_DEPTH_GRID[-1] + 50.0, args.depth_max + 1, 50.0)
@@ -58,7 +63,9 @@ def main() -> int:
     else:
         depth_grid = DEFAULT_DEPTH_GRID
 
-    df = load_chla_no3("combined", glodap_csv=DEFAULT_CSV, sprof_dir=DEFAULT_SPROF)
+    df = load_chla_no3("combined", glodap_csv=DEFAULT_CSV, sprof_dir=DEFAULT_SPROF,
+                       dark_correct=args.dark_correct,
+                       box=tuple(args.box) if args.box else None)
     df = add_relative_target(df, "Chla", rel_cap=args.rel_cap)
     if args.bin_satellite:
         from bio_params.loaders.bgc_argo import attach_surface_chla

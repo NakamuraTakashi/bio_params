@@ -39,15 +39,20 @@ def load_chla_no3(
     glodap_csv: str | Path | None = None,
     sprof_dir: str | Path | None = None,
     box: tuple[float, float, float, float] | None = None,
+    dark_correct: bool = False,
 ) -> pd.DataFrame:
-    """Common-schema rows (+ NO3 column) for levels with both Chl-a and NO3."""
+    """Common-schema rows (+ NO3 column) for levels with both Chl-a and NO3.
+
+    `dark_correct` subtracts the per-float BGC-Argo fluorescence dark offset from
+    CHLA (GLODAP is unaffected; it is extracted/HPLC).
+    """
     frames = []
     if source in ("glodap", "combined"):
         gc = load_glodap(glodap_csv, "Chla", with_time=True)
         gn = load_glodap(glodap_csv, "NO3", with_time=True)
         frames.append(_merge_chla_no3(gc, gn))
     if source in ("bgc_argo", "combined"):
-        ac = load_bgc_argo(sprof_dir, "Chla", box=box)
+        ac = load_bgc_argo(sprof_dir, "Chla", box=box, dark_correct=dark_correct)
         an = load_bgc_argo(sprof_dir, "NO3", box=box)
         frames.append(_merge_chla_no3(ac, an))
     if not frames:

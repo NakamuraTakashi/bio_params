@@ -88,6 +88,11 @@ def parse_args():
     p.add_argument("--n-hidden-layers", type=int, default=3)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no-final", action="store_true")
+    p.add_argument("--dark-correct", action="store_true",
+                   help="subtract the per-float BGC-Argo fluorescence dark offset from CHLA")
+    p.add_argument("--box", type=float, nargs=4, default=None,
+                   metavar=("LON0", "LON1", "LAT0", "LAT1"),
+                   help="restrict to a region, e.g. --box 120 160 20 50 (Japan)")
     p.add_argument("--tag", default=None)
     return p.parse_args()
 
@@ -157,7 +162,9 @@ def main() -> int:
         return 1
     base = BaseProfile.from_dict(json.loads(base_json.read_text()))
 
-    df = load_chla_no3(args.source, glodap_csv=args.csv, sprof_dir=args.sprof_dir)
+    df = load_chla_no3(args.source, glodap_csv=args.csv, sprof_dir=args.sprof_dir,
+                       dark_correct=args.dark_correct,
+                       box=tuple(args.box) if args.box else None)
     print(f"  loaded {len(df):,} co-located rows")
     df = add_mld(df)
     df = add_relative_target(df, "Chla", rel_cap=args.rel_cap)
