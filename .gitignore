@@ -51,3 +51,6 @@ docs/*.pdf
 # CMEMS credentials (never commit)
 cmems.env
 **/cmems.env
+
+# CLAUDE.md は開発指針メモ（個人用）。公開リポジトリに含めない
+CLAUDE.md
