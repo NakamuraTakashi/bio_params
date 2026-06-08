@@ -114,6 +114,31 @@ def add_mld(
     return out.drop(columns="_sig0")
 
 
+def nutricline_isopleth_depth(d, v, level=1.0, dmin=5.0):
+    """Depth (m) where NO3 first reaches `level` umol/kg below `dmin`.
+
+    The classic nitracline isopleth definition: scan downward from dmin and
+    linearly interpolate the depth of the first upward crossing of `level`. If
+    NO3 is already >= level at the shallowest in-range sample (nutrient-replete
+    surface, e.g. subpolar), returns dmin; if it never reaches `level`, NaN.
+    Less ambiguous than the gradient peak for broad/double nutriclines, but
+    sensitive to a biased surface NO3 (a false surface >= level snaps it to dmin).
+    """
+    ok = np.isfinite(d) & np.isfinite(v)
+    d, v = d[ok], v[ok]
+    order = np.argsort(d); d, v = d[order], v[order]
+    m = d >= dmin
+    d, v = d[m], v[m]
+    if len(d) < 2:
+        return np.nan
+    if v[0] >= level:
+        return float(dmin)
+    for k in range(1, len(d)):
+        if v[k] >= level and v[k - 1] < level:
+            return float(d[k - 1] + (level - v[k - 1]) / (v[k] - v[k - 1]) * (d[k] - d[k - 1]))
+    return np.nan
+
+
 def add_structure_descriptors(
     df: pd.DataFrame,
     *,
@@ -121,31 +146,40 @@ def add_structure_descriptors(
     dmin: float = 5.0,
     dmax: float = 300.0,
     min_levels: int = 4,
+    nutricline_iso: float | None = None,
+    nutricline_dmax: float | None = None,
 ) -> pd.DataFrame:
     """Add per-profile vertical-structure descriptors from the sigma_t and NO3
     columns (broadcast to every level row):
 
       z_pyc     : depth (m) of the maximum density gradient d(sigma_t)/dz  (pycnocline)
       strat_max : that maximum gradient (kg/m3/m)                          (stratification)
-      z_nutr    : depth (m) of the maximum d(NO3)/dz                        (nutricline)
-      nutr_max  : that maximum gradient (umol/kg/m)                        (nutricline sharpness)
+      z_nutr    : depth (m) of the nutricline                              (location)
+      nutr_max  : maximum d(NO3)/dz (umol/kg/m)                            (nutricline sharpness)
 
     The DCM sits near the pycnocline/nutricline, so these "where/how sharp is the
     structure" summaries carry column information the point-wise T/S/NO3 do not.
     Gradients are searched in [dmin, dmax] m; profiles with < min_levels there get
     NaN (caller drops them). sigma_t is the potential density anomaly (gsw).
     NO3 descriptors are added only if an `NO3` column is present.
+
+    z_nutr is the depth of maximum d(NO3)/dz by default; if `nutricline_iso` is
+    set (e.g. 1.0), z_nutr instead uses the NO3 == nutricline_iso umol/kg isopleth
+    (nutricline_isopleth_depth), while nutr_max stays the max gradient (sharpness).
+    `nutricline_dmax` overrides the lower search bound for the NO3 nutricline only
+    (e.g. 150 to target the first/shallow nutricline); the pycnocline keeps `dmax`.
     """
     keys = list(keys)
     out = df.copy()
     out["_sig"] = sigma0(out["salinity"].to_numpy(), out["temperature"].to_numpy(),
                          out["depth"].to_numpy(), out["latitude"].to_numpy())
     has_no3 = "NO3" in out.columns
+    no3_dmax = nutricline_dmax if nutricline_dmax is not None else dmax
 
-    def _grad_peak(d, v):
+    def _grad_peak(d, v, dmx):
         ok = np.isfinite(d) & np.isfinite(v)
         d, v = d[ok], v[ok]
-        sel = (d >= dmin) & (d <= dmax)
+        sel = (d >= dmin) & (d <= dmx)
         if sel.sum() < min_levels:
             return np.nan, np.nan
         d, v = d[sel], v[sel]
@@ -160,8 +194,14 @@ def add_structure_descriptors(
     def _desc(g: pd.DataFrame) -> pd.Series:
         g = g.sort_values("depth")
         d = g["depth"].to_numpy()
-        zp, sm = _grad_peak(d, g["_sig"].to_numpy())
-        zn, nm = (_grad_peak(d, g["NO3"].to_numpy()) if has_no3 else (np.nan, np.nan))
+        zp, sm = _grad_peak(d, g["_sig"].to_numpy(), dmax)
+        if has_no3:
+            no3 = g["NO3"].to_numpy()
+            zn_grad, nm = _grad_peak(d, no3, no3_dmax)
+            zn = (nutricline_isopleth_depth(d, no3, nutricline_iso, dmin)
+                  if nutricline_iso is not None else zn_grad)
+        else:
+            zn, nm = np.nan, np.nan
         return pd.Series(dict(z_pyc=zp, strat_max=sm, z_nutr=zn, nutr_max=nm))
 
     desc = out.groupby(keys, sort=False).apply(_desc, include_groups=False)

@@ -66,7 +66,8 @@ def _rel_pred(art_path, df, device, cutoff_override=None):
                             surface_chla_log=bool(e.get("surface_chla_log", True))).to_numpy()
         if e.get("nutricline_features") or e.get("strat_features"):
             from bio_params.profiles import add_structure_descriptors
-            d2 = add_structure_descriptors(df)
+            d2 = add_structure_descriptors(df, nutricline_iso=e.get("nutricline_iso"),
+                                           nutricline_dmax=e.get("nutricline_dmax"))
             if e.get("nutricline_features"):
                 Xp = np.column_stack([Xp, np.log(d2["z_nutr"].to_numpy() + 1.0),
                                       d2["nutr_max"].to_numpy()])

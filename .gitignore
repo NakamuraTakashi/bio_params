@@ -11,7 +11,7 @@ __pycache__/
 venv/
 env/
 
-# Data: 原本・前処理済みはコミットしない（README と .gitkeep のみ管理）
+# Data: do not commit raw/processed files (track only README and .gitkeep)
 data/**/raw/*
 data/**/processed/*
 data/**/climatology/*
@@ -31,26 +31,32 @@ data/**/climatology/*
 .DS_Store
 Thumbs.db
 
-# Notebook 実行出力（必要に応じて）
+# Notebook execution outputs (uncomment if needed)
 # *.ipynb
 
-# 生成画像はコミットしない（スクリプトで再生成可能）
+# Generated figures are not committed (regenerable by scripts)
 figures/**/*.png
 figures/*.png
+# Intermediate data from --save-field etc. (large, regenerable; e.g. field_Chla[_lowsal].npz)
+figures/**/*.npz
+figures/*.npz
 
-# docs/ 以下の md は個人メモのため公開リポジトリに含めない（履歴からも除外）
+# docs/*.md are personal notes: keep out of the public repo (also purged from history)
 docs/*.md
 docs/**/*.md
-# 参考文献の PDF はコミットしない（著作権・容量）
+# Reference PDFs are not committed (copyright / size)
 docs/**/*.pdf
 docs/*.pdf
 *.pdf
-# Dropbox が付与するサイドカー属性ファイル
+# Dropbox sidecar attribute files
 *:com.dropbox.attrs
 
 # CMEMS credentials (never commit)
 cmems.env
 **/cmems.env
 
-# CLAUDE.md は開発指針メモ（個人用）。公開リポジトリに含めない
+# CLAUDE.md is a personal dev-guide note; keep out of the public repo
 CLAUDE.md
+
+# Backup for trial/rejected models (publish only confirmed models; trials are regenerable, not committed)
+models/pretrained/backup/

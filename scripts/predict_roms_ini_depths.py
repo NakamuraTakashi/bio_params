@@ -312,6 +312,24 @@ def blend_low_salinity(pred, salinity, target):
     return blended, int((w > 0).sum())
 
 
+def apply_surface_anchor(fields, depths, sat_surf, model_surf, taper_end, clip, floor=1e-3):
+    """Rescale each per-depth field by R_eff(z) = 1 + (Rhat-1)*linear_taper(z) so the
+    surface matches the (3x3-median-smoothed) satellite Chl-a. Rhat = clip(sat /
+    model_surf, clip) bounds the correction so model extrapolation (low-salinity
+    coastal, model_surf ~ 0) cannot blow up. Returns (anchored_fields, Rhat 2D)."""
+    from scipy.ndimage import median_filter
+    fin = np.isfinite(sat_surf)
+    sm = median_filter(np.where(fin, sat_surf, 0.0), size=3)
+    sat = np.where(fin, sm, np.nan)
+    rhat = np.clip(sat / np.maximum(model_surf, floor), clip[0], clip[1])
+    rhat = np.where(np.isfinite(rhat), rhat, 1.0)
+    out = []
+    for fld, z in zip(fields, depths):
+        reff = 1.0 + (rhat - 1.0) * np.clip((taper_end - z) / taper_end, 0.0, 1.0)
+        out.append(fld * reff)
+    return out, rhat
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--source", default="glodap",
@@ -332,7 +350,59 @@ def parse_args():
                    help="surface Chl-a source for relative/anchored models: "
                         "monthly product (default) or the gapfree daily archive "
                         "(exact ini date)")
+    p.add_argument("--save-field", action="store_true",
+                   help="also save the predicted per-depth fields to "
+                        "field_<target>[_lowsal].npz (for difference maps)")
+    p.add_argument("--surface-anchor", action="store_true",
+                   help="plain Chl-a only: rescale the upper profile so the surface "
+                        "matches the satellite Chl-a, R=clip(sat/model_surf, clip) "
+                        "tapered linearly to 1 by --anchor-taper m (keeps low-salinity "
+                        "/ extrapolation regions plausible)")
+    p.add_argument("--anchor-taper", type=float, default=100.0,
+                   help="depth (m) where the surface-anchor correction fades to 1")
+    p.add_argument("--anchor-clip", type=float, nargs=2, default=[0.2, 5.0],
+                   metavar=("LO", "HI"), help="clip bounds for the surface ratio R")
     return p.parse_args()
+
+
+def _grad_peak_field(d, v, dmin=5.0, dmax=300.0):
+    """Per-column depth & magnitude of the maximum vertical gradient dv/dz in
+    [dmin, dmax]. d, v are (N,J,I) surface-first (depth increases with index).
+    Returns (zpeak, gpeak) 2D fields (NaN where no valid level)."""
+    dz = np.diff(d, axis=0); dv = np.diff(v, axis=0)
+    mid = 0.5 * (d[:-1] + d[1:])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        grad = dv / dz
+    good = np.isfinite(grad) & (dz > 0) & (mid >= dmin) & (mid <= dmax)
+    idx = np.argmax(np.where(good, grad, -np.inf), axis=0)
+    anyg = good.any(axis=0)
+    zpeak = np.where(anyg, np.take_along_axis(mid, idx[None], 0)[0], np.nan)
+    gpeak = np.where(anyg, np.maximum(np.take_along_axis(grad, idx[None], 0)[0], 0.0), np.nan)
+    return zpeak, gpeak
+
+
+def compute_struct_fields(temp, salt, z_rho, lat, lon, no3_model, no3_norm, device,
+                          low_sal=False):
+    """Per-column structure descriptors for the plain Chl-a model: nutricline
+    (z_nutr=argmax dNO3/dz, nutr_max) from the NO3-model-predicted profile, and
+    pycnocline (z_pyc=argmax d(sigma_t)/dz, strat_max) from sigma_t. Mirrors
+    bio_params.profiles.add_structure_descriptors on the ROMS grid. `low_sal`
+    applies the salinity mixing-line correction to the NO3 profile first."""
+    N, J, I = temp.shape
+    d = (-z_rho)[::-1]; T = temp[::-1]; S = salt[::-1]          # surface-first
+    lat3 = np.broadcast_to(lat[None], (N, J, I))
+    lon3 = np.broadcast_to(lon[None], (N, J, I))
+    sig = sigma0(S.ravel(), T.ravel(), d.ravel(), lat3.ravel()).reshape(N, J, I)
+    feat = pd.DataFrame({"latitude": lat3.ravel(), "longitude": lon3.ravel(),
+                         "depth": d.ravel(), "temperature": T.ravel(), "salinity": S.ravel()})
+    no3 = predict_field(no3_model, no3_norm, build_features(feat).to_numpy(),
+                        device, clip=(0.0, 60.0))
+    if low_sal:
+        no3, _ = blend_low_salinity(no3, S.ravel(), "NO3")
+    no3 = no3.reshape(N, J, I)
+    z_pyc, strat_max = _grad_peak_field(d, sig)
+    z_nutr, nutr_max = _grad_peak_field(d, no3)
+    return dict(z_nutr=z_nutr, nutr_max=nutr_max, z_pyc=z_pyc, strat_max=strat_max)
 
 
 def main() -> int:
@@ -398,6 +468,7 @@ def main() -> int:
     # (the gated Chl-a model takes NO3 as a feature: predict it first, feed it in).
     sat_field = {"loaded": False, "data": None}
     mld_field = {"loaded": False, "data": None}
+    struct_field = {"loaded": False, "data": None}
     no3_holder = {"model": None, "norm": None}
 
     for tgt in args.targets:
@@ -427,6 +498,10 @@ def main() -> int:
         base_amp = bool(extra.get("base_amp", False))
         a_max = float(extra.get("a_max", 5.0))
         base_profile = BaseProfile.from_dict(extra["base_profile"]) if base_amp else None
+        # plain direct-regression flags (combined_Chla_allfeat etc.)
+        nutricline_features = bool(extra.get("nutricline_features", False))
+        strat_features = bool(extra.get("strat_features", False))
+        cutoff_depth = extra.get("cutoff_depth")
         # models that force deep->0 by construction (no productive-layer taper,
         # surface == satellite): the light gate and the base x amplification model.
         structural = output_gate or base_amp
@@ -449,6 +524,13 @@ def main() -> int:
             print(f"  loading NO3 model for the nutrient feature ({no3_art.name}) ...")
             nm, nn, _ = load_artifact(no3_art, map_location=device)
             no3_holder.update(model=nm.to(device), norm=nn)
+        if (nutricline_features or strat_features) and not struct_field["loaded"]:
+            print("  computing nutricline/pycnocline structure fields"
+                  + ("  [low-sal NO3 corrected]" if args.low_sal_regression else "") + " ...")
+            struct_field["data"] = compute_struct_fields(
+                temp, salt, z_rho, lat, lon, no3_holder["model"], no3_holder["norm"], device,
+                low_sal=args.low_sal_regression)
+            struct_field["loaded"] = True
         m = TRACER_META[tgt]
         use_reg = args.low_sal_regression and tgt in SALINITY_REGRESSION
         print(f"{tgt}: CV R2={cv_r2:.4f}  log_target={log_target}"
@@ -460,14 +542,20 @@ def main() -> int:
 
         def _no3_for(pd_):
             # NO3 feature: predict it from the base features with the NO3 model
-            # (cache per depth). Clip to a physical range.
+            # (cache per depth). Clip to a physical range. With --low-sal-regression,
+            # blend with the salinity mixing-line so the NO3 feature is corrected at
+            # low salinity (where the MLP extrapolates) before feeding Chl-a.
             if "no3_pred" not in pd_:
-                pd_["no3_pred"] = predict_field(no3_holder["model"], no3_holder["norm"],
-                                                pd_["X"], device, clip=(0.0, 60.0))
+                no3 = predict_field(no3_holder["model"], no3_holder["norm"],
+                                    pd_["X"], device, clip=(0.0, 60.0))
+                if args.low_sal_regression:
+                    no3, _ = blend_low_salinity(no3, pd_["salinity_pts"], "NO3")
+                pd_["no3_pred"] = no3
             return pd_["no3_pred"]
 
         def _build_X(pd_):
-            if not (surface_chla or include_mld or include_no3):
+            if not (surface_chla or include_mld or include_no3
+                    or nutricline_features or strat_features):
                 return pd_["X"]
             df2 = pd_["feat_df"].copy()
             if surface_chla:
@@ -476,10 +564,19 @@ def main() -> int:
                 df2["mld"] = mld_field["data"][pd_["jj"], pd_["ii"]]
             if include_no3:
                 df2["NO3"] = _no3_for(pd_)
-            return build_features(df2, include_surface_chla=surface_chla,
-                                  surface_chla_log=surface_chla_log,
-                                  include_mld=include_mld,
-                                  include_no3=include_no3).to_numpy()
+            X = build_features(df2, include_surface_chla=surface_chla,
+                               surface_chla_log=surface_chla_log,
+                               include_mld=include_mld,
+                               include_no3=include_no3).to_numpy()
+            if nutricline_features or strat_features:
+                jj, ii = pd_["jj"], pd_["ii"]; sf = struct_field["data"]
+                cols = []
+                if nutricline_features:
+                    cols += [np.log(sf["z_nutr"][jj, ii] + 1.0), sf["nutr_max"][jj, ii]]
+                if strat_features:
+                    cols += [np.log(sf["z_pyc"][jj, ii] + 1.0), sf["strat_max"][jj, ii]]
+                X = np.column_stack([X] + cols)
+            return X
 
         def _struct_rel(pd_):
             # Relative profile for models that force deep->0 structurally.
@@ -530,7 +627,9 @@ def main() -> int:
             figsize=(4.6 * len(TARGET_DEPTHS), 5.4),
             constrained_layout=True,
         )
-        for ax, pd_ in zip(axes, per_depth):
+        saved_fields = []
+        anchored = False
+        for pd_ in per_depth:
             field = np.full((J, I), np.nan)
             jj, ii = pd_["jj"], pd_["ii"]
             X = _build_X(pd_)
@@ -556,10 +655,33 @@ def main() -> int:
             else:
                 pred = predict_field(model, normalizer, X, device,
                                      log_target=log_target, clip=m.get("clip"))
+                if cutoff_depth:                       # plain model: deep -> 0 cutoff
+                    pred = np.where(pd_["feat_df"]["depth"].to_numpy() > float(cutoff_depth),
+                                    0.0, pred)
             if use_reg:
                 pred, _ = blend_low_salinity(pred, pd_["salinity_pts"], tgt)
             field[jj, ii] = pred
+            saved_fields.append(field)
 
+        # --- optional surface anchor (plain Chl-a only): pull the upper profile
+        # toward the satellite surface, tapered to 1 by --anchor-taper m. ---
+        if (args.surface_anchor and tgt == "Chla" and not relative_target
+                and not structural):
+            if not sat_field["loaded"]:
+                sat_field["data"] = load_roms_surface_chla(
+                    lat, lon, _ini_month(INI), kind=args.satellite, date=_ini_date(INI))
+                sat_field["loaded"] = True
+            saved_fields, rhat = apply_surface_anchor(
+                saved_fields, TARGET_DEPTHS, sat_field["data"], saved_fields[0],
+                args.anchor_taper, tuple(args.anchor_clip))
+            anchored = True
+            rf = rhat[per_depth[0]["valid"]]
+            print(f"  [{tgt}] surface anchor taper->{args.anchor_taper:.0f}m "
+                  f"clip{tuple(args.anchor_clip)}: Rhat median={np.median(rf):.2f} "
+                  f"p10={np.percentile(rf, 10):.2f} p90={np.percentile(rf, 90):.2f}")
+
+        # --- plot pass ---
+        for ax, pd_, field in zip(axes, per_depth, saved_fields):
             finite = field[np.isfinite(field)]
             vmin, vmax = (np.percentile(finite, [2, 98])
                           if finite.size else (None, None))
@@ -591,16 +713,23 @@ def main() -> int:
                               pad=0.08, fraction=0.05)
             cb.set_label(f"{tgt} ({m['unit']})", fontsize=9)
 
+        anchor_note = (f"  [surface-anchored -> {args.anchor_taper:.0f}m]" if anchored else "")
         fig.suptitle(
             f"{m['long']} ({tgt}) — {args.source} MLP prediction on ROMS grid\n"
             f"{INI.name}  |  honest spatial-CV R2={cv_r2:.4f}  "
-            f"(hatch = S<{SALT_OPEN_OCEAN_MIN:.0f} PSU: extrapolation)",
+            f"(hatch = S<{SALT_OPEN_OCEAN_MIN:.0f} PSU: extrapolation){anchor_note}",
             fontsize=12,
         )
-        out = out_dir / f"pred_{tgt}_depths.png"
+        out = out_dir / f"pred_{tgt}_depths{'_anchored' if anchored else ''}.png"
         fig.savefig(out, dpi=110, bbox_inches="tight")
         plt.close(fig)
         print(f"  saved {out}")
+        if args.save_field:
+            npz = out_dir / f"field_{tgt}{'_lowsal' if args.low_sal_regression else ''}.npz"
+            np.savez(npz, lon=lon, lat=lat, depths=np.array(TARGET_DEPTHS),
+                     fields=np.stack(saved_fields),
+                     labels=np.array([p["label"] for p in per_depth]))
+            print(f"  saved {npz}")
 
     ds.close()
     g.close()

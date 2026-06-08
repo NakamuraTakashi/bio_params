@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--nutricline-features", action="store_true",
                    help="add nutricline depth (log z_nutr) + sharpness (max dNO3/dz) "
                         "features (per-profile; requires the NO3 column)")
+    p.add_argument("--nutricline-iso", type=float, default=None,
+                   help="define z_nutr by the NO3==LEVEL umol/kg isopleth (e.g. 1.0) "
+                        "instead of the max-gradient depth (nutr_max stays the gradient)")
+    p.add_argument("--nutricline-dmax", type=float, default=None,
+                   help="lower search bound (m) for the NO3 nutricline only, e.g. 150 "
+                        "to target the first/shallow nutricline (pycnocline keeps 300)")
     p.add_argument("--strat-features", action="store_true",
                    help="add pycnocline depth (log z_pyc) + stratification (max dsigma/dz)")
     p.add_argument("--mld-feature", action="store_true",
@@ -142,7 +148,8 @@ def main() -> int:
         df = df[np.isfinite(df["mld"])].reset_index(drop=True)
     if args.nutricline_features or args.strat_features:
         from bio_params.profiles import add_structure_descriptors
-        n0 = len(df); df = add_structure_descriptors(df)
+        n0 = len(df); df = add_structure_descriptors(df, nutricline_iso=args.nutricline_iso,
+                                                     nutricline_dmax=args.nutricline_dmax)
         need = (["z_nutr", "nutr_max"] if args.nutricline_features else []) + \
                (["z_pyc", "strat_max"] if args.strat_features else [])
         df = df[np.all([np.isfinite(df[c].to_numpy()) for c in need], axis=0)].reset_index(drop=True)
@@ -233,6 +240,8 @@ def main() -> int:
                          "surface_chla": surface_chla, "surface_chla_log": surface_chla_log,
                          "include_no3": args.with_no3, "cutoff_depth": args.cutoff_depth,
                          "nutricline_features": args.nutricline_features,
+                         "nutricline_iso": args.nutricline_iso,
+                         "nutricline_dmax": args.nutricline_dmax,
                          "strat_features": args.strat_features, "include_mld": args.mld_feature,
                          "log_target": False, "include_season": False,
                          "cv_rmse_mean": float(rmses.mean()), "cv_r2_mean": float(r2s.mean()),
