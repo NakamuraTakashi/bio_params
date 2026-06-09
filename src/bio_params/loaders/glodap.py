@@ -68,6 +68,8 @@ def load_glodap(
     require_flag2: bool = True,
     drop_missing_coords: bool = True,
     with_time: bool = False,
+    value_range: tuple[float, float] | None = None,
+    exclude_cruises: list[int] | None = None,
 ) -> pd.DataFrame:
     """Load one target's measurements from the GLODAP CSV.
 
@@ -107,6 +109,8 @@ def load_glodap(
     time_cols = ["G2year", "G2month", "G2day"]
     if with_time:
         needed += [c for c in time_cols if c in header]
+    if exclude_cruises and "G2cruise" in header:
+        needed.append("G2cruise")
     missing = [c for c in needed if c not in header and c not in time_cols]
     if missing:
         raise ValueError(f"CSV is missing required columns: {missing}")
@@ -130,6 +134,17 @@ def load_glodap(
 
     if drop_missing_coords:
         df = df.dropna(subset=list(COORDINATE_COLUMNS.keys()))
+
+    # Data-quality filters (e.g. non-core DOC with no 2nd QC): drop a known-bad
+    # cruise (cruise 4057 reports DOC in ugC/L, ~12x off) and/or restrict the
+    # value to a physically plausible range before training.
+    if exclude_cruises and "G2cruise" in df.columns:
+        df = df[~df["G2cruise"].isin(exclude_cruises)]
+    if "G2cruise" in df.columns:
+        df = df.drop(columns="G2cruise")
+    if value_range is not None:
+        lo, hi = value_range
+        df = df[(df[target] >= lo) & (df[target] <= hi)]
 
     # Add a flag column for non-core targets so the schema is uniform.
     flag_out = f"{target}_flag"

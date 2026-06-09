@@ -165,11 +165,20 @@ def main() -> int:
     include_sigma = bool(extra.get("include_sigma", False))
     include_mld = bool(extra.get("include_mld", False))
     aou = bool(extra.get("aou_decomposition", False))
+    # Apply the SAME data cleaning the model was trained with (e.g. DOC: drop
+    # cruise 4057 unit error, restrict to [30,150]) so the scatter is on the
+    # matching data, not the raw outlier-contaminated CSV.
+    value_range = extra.get("value_range")
+    exclude_cruise = extra.get("exclude_cruise")
     print(f"  CV (honest reference): RMSE={cv_rmse:.3g}  R²={cv_r2:.4f}"
-          + ("  [+MLD]" if include_mld else "") + ("  [AOU->O2]" if aou else ""))
+          + ("  [+MLD]" if include_mld else "") + ("  [AOU->O2]" if aou else "")
+          + (f"  [clean: range={value_range} excl={exclude_cruise}]"
+             if (value_range or exclude_cruise) else ""))
 
     print(f"Loading {target} from CSV ...")
-    df = load_glodap(args.csv, target=target, with_time=include_mld)
+    df = load_glodap(args.csv, target=target, with_time=include_mld,
+                     value_range=tuple(value_range) if value_range else None,
+                     exclude_cruises=exclude_cruise)
     if include_mld:
         df = add_mld(df)
         df = df[np.isfinite(df["mld"])].reset_index(drop=True)

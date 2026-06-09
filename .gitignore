@@ -60,3 +60,6 @@ CLAUDE.md
 
 # Backup for trial/rejected models (publish only confirmed models; trials are regenerable, not committed)
 models/pretrained/backup/
+
+# Exported weight dumps for the Fortran/portable inference path (regenerable by porting/export_weights.py)
+porting/exported/

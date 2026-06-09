@@ -72,6 +72,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--metrics-dir", type=Path, default=DEFAULT_METRICS_DIR)
     p.add_argument("--include-sigma", action="store_true",
                    help="Include sigma_theta (potential density) as a feature")
+    p.add_argument("--tag", default=None,
+                   help="Suffix for artifact/metrics names, e.g. --tag clean -> "
+                        "glodap_<target>_clean.pt / cv_<target>_clean.json")
+    p.add_argument("--value-range", type=float, nargs=2, default=None,
+                   metavar=("LO", "HI"),
+                   help="keep only target values in [LO,HI] (data cleaning), "
+                        "e.g. --value-range 30 150 for DOC")
+    p.add_argument("--exclude-cruise", type=int, nargs="+", default=None,
+                   help="drop these GLODAP cruise numbers (e.g. 4057 = DOC unit error)")
     p.add_argument("--folds", type=int, default=5)
     p.add_argument("--block-deg", type=float, default=5.0)
     p.add_argument("--epochs", type=int, default=200)
@@ -92,10 +101,15 @@ def main() -> int:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    print(f"=== target={args.target}  spatial block CV ===")
+    suffix = f"_{args.tag}" if args.tag else ""
+    print(f"=== target={args.target}{suffix}  spatial block CV ===")
     print(f"Loading {args.csv} ...")
-    df = load_glodap(args.csv, target=args.target)
-    print(f"  rows after coord/flag filtering: {len(df):,}")
+    df = load_glodap(args.csv, target=args.target,
+                     value_range=tuple(args.value_range) if args.value_range else None,
+                     exclude_cruises=args.exclude_cruise)
+    if args.value_range or args.exclude_cruise:
+        print(f"  cleaning: value_range={args.value_range} exclude_cruise={args.exclude_cruise}")
+    print(f"  rows after coord/flag/clean filtering: {len(df):,}")
 
     feats = build_features(df, include_sigma_theta=args.include_sigma)
     fnames = feature_names(include_sigma_theta=args.include_sigma)
@@ -168,8 +182,10 @@ def main() -> int:
         "r2_std": float(r2s.std()),
         "folds": fold_metrics,
     }
+    payload["value_range"] = args.value_range
+    payload["exclude_cruise"] = args.exclude_cruise
     args.metrics_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = args.metrics_dir / f"cv_{args.target}.json"
+    metrics_path = args.metrics_dir / f"cv_{args.target}{suffix}.json"
     metrics_path.write_text(json.dumps(payload, indent=2))
     print(f"\nSaved CV metrics -> {metrics_path}")
 
@@ -195,7 +211,7 @@ def main() -> int:
     final_res = train(final_model, train_ds, val_ds, train_cfg)
     print(f"  trained for {final_res.n_epochs_run} epochs")
 
-    artifact_path = args.out_dir / f"glodap_{args.target}.pt"
+    artifact_path = args.out_dir / f"glodap_{args.target}{suffix}.pt"
     save_artifact(
         artifact_path,
         model=final_model,
@@ -212,6 +228,8 @@ def main() -> int:
             "cv_block_deg": args.block_deg,
             "cv_n_folds": args.folds,
             "include_sigma": args.include_sigma,
+            "value_range": args.value_range,
+            "exclude_cruise": args.exclude_cruise,
             "epochs_run_final": final_res.n_epochs_run,
         },
     )
