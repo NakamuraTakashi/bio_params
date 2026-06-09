@@ -165,6 +165,28 @@ def _full_metrics(obs, pred, eps=0.01):
                 le_r2=le_r2, le_rmse=le_rmse)
 
 
+def apply_surface_anchor(df, pred, anchor_col="_sat_daily", taper=100.0, clip=(0.2, 5.0), floor=1e-3):
+    """Per profile (latitude,longitude,time): rescale the upper layer toward the
+    surface anchor value in `anchor_col` (daily satellite `_sat_daily`, or the
+    in-situ surface `Chla_surf`), tapered to 1 by `taper` m. Profiles with no
+    finite anchor value are left unchanged. Returns the anchored array."""
+    out = np.asarray(pred, dtype=np.float64).copy()
+    depth = df["depth"].to_numpy()
+    work = df.assign(_p=out, _i=np.arange(len(df)))
+    for _, g in work.groupby(["latitude", "longitude", "time"], sort=False):
+        s = g[anchor_col].iloc[0]
+        if not np.isfinite(s):
+            continue
+        idx = g["_i"].to_numpy(); d = depth[idx]; p = out[idx]
+        order = np.argsort(d); pm = p[order]; ok = np.isfinite(pm) & (pm > floor)
+        if not ok.any():
+            continue
+        msurf = pm[ok][0]                                   # shallowest finite pred
+        rhat = float(np.clip(s / max(msurf, floor), clip[0], clip[1]))
+        out[idx] = p * (1.0 + (rhat - 1.0) * np.clip((taper - d) / taper, 0.0, 1.0))
+    return out
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--tags", nargs="+", default=[],
@@ -184,6 +206,15 @@ def main() -> int:
                         "absolute; 'combined' adds BGC-Argo)")
     p.add_argument("--cutoff", type=float, default=None,
                    help="override the plain-model hard 0-cutoff depth (m); 0 = none")
+    p.add_argument("--surface-anchor", action="store_true",
+                   help="also report metrics after the daily-satellite surface anchor "
+                        "(rescale each profile's upper layer to _sat_daily, taper to 1 by "
+                        "--anchor-taper m, clip the ratio)")
+    p.add_argument("--anchor-taper", type=float, default=100.0)
+    p.add_argument("--anchor-clip", type=float, nargs=2, default=[0.2, 5.0])
+    p.add_argument("--anchor-source", choices=["satellite", "insitu"], default="satellite",
+                   help="anchor target: 'satellite' (_sat_daily, real inference) or "
+                        "'insitu' (Chla_surf, ground-truth surface = upper bound)")
     args = p.parse_args()
     entries = [(t, MODEL_DIR / f"combined_Chla_gated_{t}.pt") for t in args.tags]
     entries += [(m, MODEL_DIR / f"{m}.pt") for m in args.models]
@@ -223,6 +254,16 @@ def main() -> int:
         print(f"  global (obs>=0.02): log10-RMSE {rmse:.3f}  bias {bias:.2f}  (n={n:,})")
         print(f"  global (ALL pts, n={fm['n']:,}): linear R2={fm['lin_r2']:.3f} RMSE={fm['lin_rmse']:.3f}"
               f"  | log10(x+.01) R2={fm['le_r2']:.3f} RMSE={fm['le_rmse']:.3f}")
+        if args.surface_anchor:
+            acol = "_sat_daily" if args.anchor_source == "satellite" else "Chla_surf"
+            pa = apply_surface_anchor(df, pred, anchor_col=acol,
+                                      taper=args.anchor_taper, clip=tuple(args.anchor_clip))
+            fma = _full_metrics(obs, pa)
+            lowma = np.isfinite(pa) & (obs < 0.05)
+            overa = int((lowma & (pa > 0.1)).sum())
+            print(f"  [+ANCHOR:{args.anchor_source} taper{args.anchor_taper:.0f}] linear R2={fma['lin_r2']:.3f} "
+                  f"RMSE={fma['lin_rmse']:.3f} | log10(x+.01) R2={fma['le_r2']:.3f} "
+                  f"RMSE={fma['le_rmse']:.3f} | false+={100*overa/max(int(lowma.sum()),1):.1f}%")
         # deep false-positive: where obs is near-zero, how much Chl does the model put?
         lowm = np.isfinite(pred) & (obs < 0.05)
         fp = float(np.sqrt(np.mean((pred[lowm] - obs[lowm]) ** 2))) if lowm.any() else float("nan")

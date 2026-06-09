@@ -41,7 +41,7 @@ TARGET_DEPTHS = [0.0, 200.0, 500.0, 1000.0, 3000.0]   # 0 -> surface (shallowest
 # target -> model source (combined for O2/NO3; GLODAP otherwise)
 SOURCE = {"O2": "combined", "NO3": "combined", "TA": "glodap", "DIC": "glodap",
           "SiO4": "glodap", "PO4": "glodap", "C13": "glodap", "C14": "glodap"}
-DEFAULT_TARGETS = ["TA", "DIC", "O2", "C13", "C14", "SiO4", "PO4", "NO3"]
+DEFAULT_TARGETS = ["TA", "DIC", "O2", "C13", "C14", "SiO4", "PO4", "NO3", "DOC"]
 
 
 def fora_url(kind: str, date) -> str:

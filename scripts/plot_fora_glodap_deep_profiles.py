@@ -27,7 +27,8 @@ from bio_params.persist import load_artifact
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from predict_roms_ini_depths import TRACER_META, blend_low_salinity, predict_field  # noqa: E402
+from predict_roms_ini_depths import (                                              # noqa: E402
+    TRACER_META, blend_low_salinity, predict_field, _nearest_index)
 from predict_fora_chla import fora_url                                              # noqa: E402
 from plot_fora_glodap_site_profiles import struct_for_column                        # noqa: E402
 
@@ -86,6 +87,12 @@ def main() -> int:
     ap.add_argument("--ymax", type=float, default=None,
                     help="cap the depth axis at this depth (m), e.g. --ymax 300 to "
                          "zoom into the upper ocean")
+    ap.add_argument("--surface-anchor", action="store_true",
+                    help="rescale the Chl-a profile to the daily satellite surface "
+                         "Chl-a at each site (R=clip(sat/model_surf, clip), taper to 1 "
+                         "by --anchor-taper m)")
+    ap.add_argument("--anchor-taper", type=float, default=100.0)
+    ap.add_argument("--anchor-clip", type=float, nargs=2, default=[0.2, 5.0])
     args = ap.parse_args()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -142,6 +149,23 @@ def main() -> int:
         chlam = predict_field(chla_model, chla_norm, X, device, clip=TRACER_META["Chla"]["clip"])
         chlam = np.where(dz > cutoff, 0.0, chlam)
 
+        # daily-satellite surface anchor (taper to 1 by --anchor-taper m)
+        if args.surface_anchor:
+            from bio_params.satellite import chla_day_field
+            lo_c, hi_c = args.anchor_clip
+            try:
+                la_ax, lo_ax, arr, _ = chla_day_field(r.date.strftime("%Y-%m-%d"))
+                il = int(_nearest_index(np.array([r.lat]), la_ax)[0])
+                io = int(_nearest_index(((np.array([r.lon]) + 180) % 360) - 180, lo_ax)[0])
+                sat = float(arr[il, io])
+            except Exception as exc:                          # day missing -> no anchor
+                sat = np.nan; print(f"  [{sid}] no daily satellite ({exc}); skip anchor")
+            msurf = chlam[0] if len(chlam) and np.isfinite(chlam[0]) else np.nan
+            if np.isfinite(sat) and np.isfinite(msurf) and msurf > 1e-3:
+                rhat = float(np.clip(sat / msurf, lo_c, hi_c))
+                chlam = chlam * (1.0 + (rhat - 1.0)
+                                 * np.clip((args.anchor_taper - dz) / args.anchor_taper, 0.0, 1.0))
+
         ax = axes[row, 0]
         ax.plot(obs_no3.G2nitrate, obs_no3.G2depth, "o", color="tab:blue", ms=5, label="GLODAP obs")
         ax.plot(no3m, dz, "-", color="tab:red", lw=1.8, label="model (combined, low-sal)")
@@ -153,7 +177,8 @@ def main() -> int:
 
         ax = axes[row, 1]
         ax.plot(obs_chla.G2chla, obs_chla.G2depth, "o", color="tab:green", ms=5, label="GLODAP obs")
-        ax.plot(chlam, dz, "-", color="tab:red", lw=1.8, label="model (allfeat)")
+        ax.plot(chlam, dz, "-", color="tab:red", lw=1.8,
+                label="model (allfeat + daily-sat anchor)" if args.surface_anchor else "model (allfeat)")
         ax.set_ylim(ymax, 0); ax.set_xlabel("Chl-a (mg/m3)")
         ax.axhline(seafloor, color="0.4", lw=0.8, ls=":")
         ax.set_title(f"{label}  Chl-a", fontsize=9); ax.grid(alpha=0.3)
@@ -161,15 +186,17 @@ def main() -> int:
 
     note = (f"  [0-{args.ymax:.0f} m zoom]" if args.ymax is not None
             else "  [to seafloor]" if args.full_depth else "")
+    note += "  [Chl-a: daily-sat anchored]" if args.surface_anchor else ""
     fig.suptitle("Observed (GLODAP, deepest-NO3 sites) vs model vertical profiles on "
                  "FORA-JPN60 T/S — NO3 & Chl-a" + note, fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.985))
+    asfx = "_anchored" if args.surface_anchor else ""
     if args.ymax is not None:
-        out = OUT_DIR / f"fora_glodap_deep_site_profiles_{int(args.ymax)}m.png"
+        out = OUT_DIR / f"fora_glodap_deep_site_profiles_{int(args.ymax)}m{asfx}.png"
     elif args.full_depth:
-        out = OUT_DIR / "fora_glodap_deep_site_profiles_fulldepth.png"
+        out = OUT_DIR / f"fora_glodap_deep_site_profiles_fulldepth{asfx}.png"
     else:
-        out = OUT_DIR / "fora_glodap_deep_site_profiles.png"
+        out = OUT_DIR / f"fora_glodap_deep_site_profiles{asfx}.png"
     fig.savefig(out, dpi=120, bbox_inches="tight"); plt.close(fig)
     print(f"saved {out}", flush=True)
     return 0
